@@ -3,7 +3,7 @@
 # The `scopes` module
 
 Here, we implement algorithms and ways to handle
-scope treatment. 
+scope treatment.
 This will be used in the type checker context.
 
  */
@@ -13,16 +13,16 @@ use core::slice;
 use derive_getters::Getters;
 use indexmap::IndexMap;
 
-use crate::ast::typing::{NameIndex, Type};
+use crate::ast::{typing::{NameIndex, Type}, Loc};
 
 use super::ActFunction;
 
 /// The type used to store variables in the scope.
-/// 
+///
 /// We use `IndexMap` instead of a regular `HashMap`
 /// here because their creation order matters when
 /// we are invoking type destructors*.
-/// 
+///
 /// ***Destructors**: Functions which **run when** a value
 /// **exists scope**. This is a concept from **RAII**.
 pub type Variables = IndexMap<NameIndex, Variable>;
@@ -31,24 +31,26 @@ pub type Variables = IndexMap<NameIndex, Variable>;
 /// Data about a variable.
 pub struct Variable {
     /// The type of the variable.
-    /// 
+    ///
     /// As types are not explicitly declared
     /// for locals, this will be always inferred
     /// by the expression it is assigned to.
     pub ty: Type,
     /// If the variable is an argument
     /// or not.
-    pub is_argument: bool,
+    /// 
+    /// Has the index of the argument.
+    pub is_argument: Option<usize>,
     /// If the variable was already initialized.
     /// Accessing an uninitialized slot is an error.
     pub init: bool,
+    /// If this variable is mutable or not.
+    pub mutability: Option<Loc>,
 }
 
 impl Variable {
     /// Sets this variable to be initialized.
-    pub fn initialize(
-        &mut self
-    ) {
+    pub fn initialize(&mut self) {
         self.init = true;
     }
 }
@@ -60,7 +62,7 @@ pub struct Scope {
     variables: Variables,
     /// If this scope is from a function,
     /// and if yes, the function itself.
-    /// 
+    ///
     /// We do not include a separate parent
     /// namespace here because the function
     /// already includes it.
@@ -92,14 +94,22 @@ impl Scope {
     }
 
     /// Inserts a variable inside of this scope.
-    pub fn insert_variable(&mut self, name: NameIndex, ty: Type, is_argument: bool) -> Option<Variable> {
+    pub fn insert_variable(
+        &mut self,
+        name: NameIndex,
+        ty: Type,
+        is_argument: Option<usize>,
+        mutability: Option<Loc>,
+        is_initialized: bool,
+    ) -> Option<Variable> {
         self.variables.insert(
             name,
             Variable {
                 ty,
                 is_argument,
-                init: false,
-            }
+                init: is_initialized,
+                mutability,
+            },
         )
     }
 }
@@ -114,22 +124,25 @@ pub struct Scopes {
 impl Scopes {
     /// Constructs a new `Scopes`.
     pub fn new() -> Self {
-        Self {
-            scopes: Vec::new(),
-        }
+        Self { scopes: Vec::new() }
     }
 
     /// Pushes a new scope to these scopes.
     pub fn push_scope(&mut self, function: Option<ActFunction>, not_safe: bool) {
-        self.scopes.push(
-            Scope::new(function, not_safe)
-        )
+        self.scopes.push(Scope::new(function, not_safe))
     }
 
     /// Returns an optional shared reference to the last
     /// scope of this `Scopes`.
     pub fn last_scope(&self) -> Option<&Scope> {
         self.scopes.last()
+    }
+
+    /// Returns an optional shared reference to the last
+    /// scope of this `Scopes` which is the root of a function.
+    pub fn last_function_scope(&self) -> Option<&Scope> {
+        self.scopes.iter()
+            .find(|item| item.function.is_some())
     }
 
     /// Returns an optional mutable reference to the last
@@ -140,7 +153,7 @@ impl Scopes {
 
     /// Returns a shared reference to the last
     /// scope of this `Scopes`.
-    /// 
+    ///
     /// # Panics
     /// This calls `unwrap` so, if there is
     /// no last scope, this panics.
@@ -150,7 +163,7 @@ impl Scopes {
 
     /// Returns a mutable reference to the last
     /// scope of this `Scopes`.
-    /// 
+    ///
     /// # Panics
     /// This calls `unwrap` so, if there is
     /// no last scope, this panics.
@@ -170,11 +183,11 @@ impl Scopes {
             match scope.search_for_variable(name) {
                 // return the variable if found
                 Some(var) => return Some(var),
-                None if scope.function.is_some() =>  {
+                None if scope.function.is_some() => {
                     // if the current scope is a function,
                     // stop the search
                     break;
-                },
+                }
                 None => {
                     // continue otherwise
                     continue;
@@ -194,11 +207,11 @@ impl Scopes {
             match scope.search_for_variable_mut(name) {
                 // return the variable if found
                 Some(var) => return Some(var),
-                None if is_function_scope =>  {
+                None if is_function_scope => {
                     // if the current scope is a function,
                     // stop the search
                     break;
-                },
+                }
                 None => {
                     // continue otherwise
                     continue;

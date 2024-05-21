@@ -8,9 +8,9 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use crate::ast::{typing::NameIndex, Collection};
+use crate::ast::{tdecl::UserType, typing::NameIndex, Collection};
 
-use super::{ActFunction, Function};
+use super::{ActCtxUserType, ActFunction, ActGenericFunction, CtxUserType, Function};
 
 /// The children of an already existing namespace.
 pub type NamespaceChildren = HashMap<NameIndex, ActNamespace>;
@@ -32,6 +32,14 @@ pub struct Namespace {
 
     /// The members of the namespace.
     members: Members,
+}
+
+impl PartialEq for Namespace {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+        && self.parent == other.parent
+        && self.children == other.children
+    }
 }
 
 /// A namespace which you can actually use.
@@ -66,6 +74,10 @@ pub type Members = HashMap<NameIndex, Member>;
 pub enum Member {
     /// A function inside of the namespace.
     Function(ActFunction),
+    /// A generic function.
+    GenericFunction(ActGenericFunction),
+    /// A defined type.
+    Type(ActCtxUserType),
 }
 
 /// Adds a child namespace to an
@@ -106,15 +118,12 @@ pub fn add_child_namespace(
 fn add_used_namespace(
     namespace: &ActNamespace,
     name: NameIndex,
-    used: WeakNamespace
+    used: WeakNamespace,
 ) -> (Option<WeakNamespace>, WeakNamespace) {
     // insert the used namespace and
     // return it
     (
-        namespace
-            .borrow_mut()
-            .used
-            .insert(name, Weak::clone(&used)),
+        namespace.borrow_mut().used.insert(name, Weak::clone(&used)),
         used,
     )
 }
@@ -144,13 +153,13 @@ pub type NamespaceSearchError = Vec<NameIndex>;
 /// inside of the namespace, returning the
 /// `WeakNamespace` if found or an error
 /// if not.
-/// 
+///
 /// We use `WeakNamespace` instead of `ActNamespace`
 /// here because we may get an used namespace instead
 /// of an actual child namespace.
-/// 
+///
 /// If we get an used one, we just return it. Othewise,
-/// if we 
+/// if we
 ///
 /// See [`NamespaceSearchError`] to interpret
 /// this function's errors.
@@ -172,23 +181,22 @@ fn search_into_children_imp(
             // add to unwound
             unwound.push(namespace_to_search_for);
 
-            let upgraded = namespace.upgrade().expect("Namespace somehow got out of scope (bug)");
+            let upgraded = namespace
+                .upgrade()
+                .expect("Namespace somehow got out of scope (bug)");
             let mut borrowed = upgraded.borrow_mut();
 
             // search into children
-            match borrowed
-                .children
-                .get_mut(&namespace_to_search_for)
-            {
-                Some(child_found) => search_into_children_imp(&Rc::downgrade(child_found), path, unwound),
+            match borrowed.children.get_mut(&namespace_to_search_for) {
+                Some(child_found) => {
+                    search_into_children_imp(&Rc::downgrade(child_found), path, unwound)
+                }
                 // if not found search into used namespaces
-                None => match borrowed
-                    .used
-                    .get_mut(&namespace_to_search_for) {
-                        Some(used_found) => search_into_children_imp(used_found, path, unwound),
-                        // if not found is an error
-                        None => Err(unwound),
-                    },
+                None => match borrowed.used.get_mut(&namespace_to_search_for) {
+                    Some(used_found) => search_into_children_imp(used_found, path, unwound),
+                    // if not found is an error
+                    None => Err(unwound),
+                },
             }
         }
         None => {
@@ -203,13 +211,9 @@ fn search_into_children_imp(
 
 /// Searches inside of a namespace for
 /// its members.
-pub fn search_into_members<'a>(
-    namespace: &'a ActNamespace,
-    name: &NameIndex
-) -> Option<Member> {
-    let borrowed = namespace
-        .borrow();
-    
+pub fn search_into_members<'a>(namespace: &'a ActNamespace, name: &NameIndex) -> Option<Member> {
+    let borrowed = namespace.borrow();
+
     borrowed.members.get(name).cloned()
 }
 
@@ -266,15 +270,15 @@ pub fn add_member(
     namespace: &ActNamespace,
     name: NameIndex,
     member: Member,
-) -> Result<(), AddMemberError> {
+) -> Result<Member, AddMemberError> {
     let mut namespace_ref = namespace.borrow_mut();
 
     if namespace_ref.children.get(&name).is_some() {
         Err(AddMemberError::ChildCollision(name, member))
     } else {
-        match namespace_ref.members.insert(name, member) {
+        match namespace_ref.members.insert(name, member.clone()) {
             Some(old) => Err(AddMemberError::AlreadyExists(name, old)),
-            None => Ok(()),
+            None => Ok(member),
         }
     }
 }
@@ -284,8 +288,26 @@ pub fn add_function(
     namespace: &ActNamespace,
     name: NameIndex,
     function: ActFunction,
-) -> Result<(), AddMemberError> {
+) -> Result<Member, AddMemberError> {
     add_member(namespace, name, Member::Function(function))
+}
+
+/// Adds a generic function to a namespace.
+pub fn add_generic_function(
+    namespace: &ActNamespace,
+    name: NameIndex,
+    function: ActGenericFunction,
+) -> Result<Member, AddMemberError> {
+    add_member(namespace, name, Member::GenericFunction(function))
+}
+
+/// Adds an user defined type to a namespace.
+pub fn add_user_type(
+    namespace: &ActNamespace,
+    name: NameIndex,
+    ty: CtxUserType,
+) -> Result<Member, AddMemberError> {
+    add_member(namespace, name, Member::Type(ActCtxUserType::new(RefCell::new(ty))))
 }
 
 #[cfg(test)]

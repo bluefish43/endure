@@ -111,8 +111,12 @@ impl PartialEq for Identifier {
 }
 
 impl Identifier {
-    pub fn loc(&self) -> &Loc { &self.0 }
-    pub fn index(&self) -> NameIndex { self.1 }
+    pub fn loc(&self) -> &Loc {
+        &self.0
+    }
+    pub fn index(&self) -> NameIndex {
+        self.1
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -144,7 +148,7 @@ pub enum SumTypeAttribute {
 
 #[derive(new)]
 /// The declaration of a namespace.
-pub struct NamespaceDecl{
+pub struct NamespaceDecl {
     pub namespace_kw: Loc,
     pub name: Identifier,
     pub left_key: Loc,
@@ -158,12 +162,17 @@ pub struct NamespaceDecl{
 /// A function declaration, a sum type
 /// declaration or any other of those.
 pub enum Decl {
+    /// The declaration of a namespace.
+    NamespaceDecl(NamespaceDecl),
+
     /// The declaration of a function.
     FunctionDecl(FunctionDecl),
-    NamespaceDecl(NamespaceDecl)
+
+    /// The declaration of a type.
+    TypeDecl(TypeDecl),
 }
 
-#[derive(new)]
+#[derive(Debug, new, Clone)]
 /// Declaring a function within the
 /// local namespace.
 pub struct FunctionDecl {
@@ -175,6 +184,17 @@ pub struct FunctionDecl {
     pub prototype: Prototype,
     /// The block of the function.
     pub block: Block,
+}
+
+impl FunctionDecl {
+    pub fn replace_generic(&mut self, new_name: Identifier, generics: &HashMap<NameIndex, Type>) {
+        self.prototype.name = new_name;
+        self.prototype.replace_generic(generics);
+        self.prototype.generics = None;
+        self.block.stmts.iter_mut().for_each(|stmt| {
+            stmt.replace_generic(generics)
+        })
+    }
 }
 
 #[derive(new, Debug, Clone, Getters)]
@@ -189,11 +209,22 @@ pub struct Prototype {
     pub arguments: Vec<Argument>,
     /// The right parenthesis, closing the arguments.
     right_paren: Loc,
+    /// The optional generics of this function.
+    generics: Option<Generics>,
     /// The return type.
     /// Note: if not provided, this defaults to `void`.
     pub return_type: Box<Type>,
     /// If this function is marked as `unsafe`.
     pub unsafety: bool,
+}
+
+impl Prototype {
+    pub fn replace_generic(&mut self, generics: &HashMap<NameIndex, Type>) {
+        self.arguments.iter_mut().for_each(|argument| {
+            argument.ty.replace_generic(generics)
+        });
+        self.return_type.replace_generic(generics)
+    }
 }
 
 #[derive(new, Debug, Clone)]
@@ -203,9 +234,11 @@ pub struct Argument {
     pub name: Identifier,
     /// The type of the argument.
     pub ty: Type,
+    /// If this argument is mutable.
+    pub mutability: Option<Loc>,
 }
 
-#[derive(new, Getters, Debug)]
+#[derive(new, Getters, Debug, Clone)]
 /// The block of the function.
 pub struct Block {
     /// The `in`, `then` or any other
@@ -230,31 +263,30 @@ pub mod expr {
 
      */
 
+    use std::collections::HashMap;
+
     use derive_new::new;
 
-    use super::{Block, Identifier, IntLit, Loc, Type};
+    use super::{Block, Identifier, IntLit, Loc, NameIndex, Type};
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// A while loop.
-    pub struct WhileLoop{
+    pub struct WhileLoop {
         pub while_kw: Loc,
         pub condition: Box<Expr>,
         pub block: Block,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// A conditional expression
-    pub struct Conditional{
+    pub struct Conditional {
         pub if_kw: Loc,
         pub condition: Box<Expr>,
         pub then: Block,
-        pub else_part: Option<(
-            Loc,
-            Block,
-        )>,
+        pub else_part: Option<(Loc, Block)>,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// An expression which can be used
     /// as a value or not.
     pub enum Expr {
@@ -262,16 +294,26 @@ pub mod expr {
         Literal(LiteralExpr),
         Binary(BinaryExpr),
         Assignment(AssignmentExpr),
-        SlotDecl(Identifier, Type),
+        AccessProperty(Box<Expr>, Loc, Identifier),
+        SlotDecl { mutability: Option<Loc>, name: Identifier, ty: Type },
         Call(CallExpr),
         /// The use of a variable as an expression.
         Variable(Identifier),
+        /// Instantiates a generic function with the
+        /// provided template types.
+        GenericInstantiation(Identifier, Vec<Type>),
+        /// The instantiation of a struct.
+        /// 
+        /// Here we have its name and its fields.
+        InstantiateStruct(Identifier, Vec<(Identifier, Expr)>),
+        /// Dereference a pointer.
+        Dereference(Loc, Box<Expr>),
         Return(ReturnExpr),
         Conditional(Conditional),
         WhileLoop(WhileLoop),
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// A special type of expression in which,
     /// if available, returns an lvalue instead
     /// of an rvalue.
@@ -305,7 +347,7 @@ pub mod expr {
     /// * The left hand side must be an lvalue OR must
     ///   support having its reference taken;
     #[repr(transparent)]
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct AssignmentExpr(pub BinaryExpr);
 
     #[derive(Debug, Clone)]
@@ -320,7 +362,7 @@ pub mod expr {
         Int(IntLit),
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// A binary expression is formed by the
     /// left hand side (the left side of the
     /// binary operator), the binary operator
@@ -340,7 +382,7 @@ pub mod expr {
         pub right_hand_side: Box<Expr>,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// The returning of a value.
     pub struct ReturnExpr {
         pub ret_kw: Loc,
@@ -358,11 +400,12 @@ pub mod expr {
         fn to_string(&self) -> String {
             match self {
                 Self::Plus => "+",
-            }.to_string()
+            }
+            .to_string()
         }
     }
 
-    #[derive(Debug, new)]
+    #[derive(Debug, new, Clone)]
     /// A function call.
     pub struct CallExpr {
         /// What we're calling.
@@ -375,34 +418,57 @@ pub mod expr {
         /// Returns the location of an expression.
         pub fn loc(&self) -> Loc {
             match self {
+                Expr::Dereference(deref, _) => deref.clone(),
+                Expr::AccessProperty(_, dot, _) => dot.clone(),
                 Expr::AsReference(asref) => asref.0.clone(),
                 Expr::Assignment(assignment) => assignment.0.left_hand_side.loc(),
                 Expr::Binary(bin) => bin.left_hand_side.loc(),
                 Expr::Call(c) => c.callee.loc(),
                 Expr::Literal(lit) => match lit {
                     LiteralExpr::Int(i) => i.0.clone(),
-                }
+                },
+                Expr::GenericInstantiation(name, _) => name.loc().clone(),
                 Expr::Variable(v) => v.0.clone(),
-                Expr::SlotDecl(name, _ty) => name.0.clone(),
+                Expr::SlotDecl { mutability: _, name, ty: _ } => name.0.clone(),
                 Expr::Return(r) => r.ret_kw.clone(),
                 Expr::Conditional(Conditional { if_kw, .. }) => if_kw.clone(),
-                Expr::WhileLoop(WhileLoop { while_kw, condition, block }) => while_kw.clone(),
+                Expr::WhileLoop(WhileLoop {
+                    while_kw,
+                    condition,
+                    block,
+                }) => while_kw.clone(),
+                Expr::InstantiateStruct(name, fields) => name.0.clone(),
+            }
+        }
+
+        pub fn replace_generic(&mut self, generics: &HashMap<NameIndex, Type>) {
+            match self {
+                Expr::SlotDecl { mutability, name, ty } => {
+                    if let Type::NamedType(decl_name) = ty {
+                        if let Some(to) = generics.get(&decl_name.1) {
+                            *ty = to.clone();
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
 }
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use derive_getters::Getters;
 use derive_new::new;
 use typing::*;
 
-use self::expr::Expr;
+use self::{expr::Expr, generics::Generics, tdecl::TypeDecl};
 
 pub mod typing {
     //! # The `typing` submodule
     //! Utilities related to AST types.
+
+    use std::collections::HashMap;
 
     use derive_new::new;
 
@@ -482,6 +548,20 @@ pub mod typing {
         },
         /// A named type.
         NamedType(Identifier),
+        /// A named type which is being instantiated.
+        /// 
+        /// It's what is being instantiated and its
+        /// templated parameters.
+        Instantiated {
+            /// The name of the type being instantiated.
+            name: Identifier,
+            /// The left bracket token.
+            lbrac: Loc,
+            /// The generics used to instantiate.
+            instantiated: Vec<Type>,
+            /// The right bracket token.
+            rbrac: Loc,
+        },
         /// A sized array as in `[32 of u64]`.
         SizedArray {
             /// The left bracket token.
@@ -497,7 +577,12 @@ pub mod typing {
         },
         /// It's essentially a pointer, but we
         /// may add special checkings in the future.
-        Pointer(Box<Type>),
+        Pointer {
+            /// What this pointer is pointing too; its pointee.
+            pointee: Box<Type>,
+            /// If we can change the value at this location.
+            mutability: Option<Loc>,
+        },
         /// A pointer to a function.
         FunctionPointer(Prototype),
         /// The void     type.
@@ -512,25 +597,63 @@ pub mod typing {
         pub fn is_trivially_copyable(&self) -> bool {
             match self {
                 Self::Primitive { .. } => true,
-                Self::SizedArray { element_type, .. } => {
-                    element_type.is_trivially_copyable()
-                }
-                Self::Void
-                | Self::Universe => true,
-                _ => false
+                Self::SizedArray { element_type, .. } => element_type.is_trivially_copyable(),
+                Self::Void | Self::Universe => true,
+                _ => false,
             }
         }
 
         pub fn is_float(&self) -> bool {
-            matches!(self, Self::Primitive { ty: PrimType::Float(_), .. })
+            matches!(
+                self,
+                Self::Primitive {
+                    ty: PrimType::Float(_),
+                    ..
+                }
+            )
         }
 
         pub fn is_int(&self) -> bool {
-            matches!(self, Self::Primitive { ty: PrimType::Int(_), .. })
+            matches!(
+                self,
+                Self::Primitive {
+                    ty: PrimType::Int(_),
+                    ..
+                }
+            )
         }
 
         pub fn is_uint(&self) -> bool {
-            matches!(self, Self::Primitive { ty: PrimType::UInt(_), .. })
+            matches!(
+                self,
+                Self::Primitive {
+                    ty: PrimType::UInt(_),
+                    ..
+                }
+            )
+        }
+
+        pub fn replace_generic(&mut self, generics: &HashMap<NameIndex, Type>) {
+            match self {
+                Type::FunctionPointer(proto) => {
+                    proto.replace_generic(generics)
+                }
+                Type::Instantiated { name, lbrac, instantiated, rbrac } => {
+                    instantiated.iter_mut().for_each(|ty| {
+                        ty.replace_generic(generics)
+                    })
+                }
+                Type::NamedType(name) => if let Some(to) = generics.get(&name.index()) {
+                    *self = to.clone();
+                },
+                Type::Pointer { pointee, mutability } => {
+                    pointee.replace_generic(generics)
+                }
+                Type::SizedArray { left_bracket, size, of, element_type, right_bracket } => {
+                    element_type.replace_generic(generics)
+                }
+                _ => {}
+            }
         }
     }
 
@@ -546,9 +669,164 @@ pub mod typing {
                 (Self::Primitive { ty, .. }, Self::Primitive { ty: ty2, .. }) => ty == ty2,
                 (Self::NamedType(named), Self::NamedType(named2)) => named == named2,
                 (Self::Void, Self::Void) => true,
-                (Self::Pointer(pointee1), Self::Pointer(pointee2)) => pointee1 == pointee2,
+                (Self::Pointer { pointee, mutability }, Self::Pointer { pointee: pointee2, mutability: mutability2 }) => pointee == pointee2 && mutability.is_some() == mutability2.is_some(),
                 _ => false,
             }
         }
+    }
+}
+
+pub mod generics {
+    /*!
+    
+    # The `generics` module
+
+    This module includes everything 
+
+     */
+
+    use derive_getters::Getters;
+    use derive_new::new;
+
+    use super::{expr::Expr, Identifier, Loc};
+
+    #[derive(new, Debug, Clone, Getters)]
+    /// The generics of a prototype.
+    pub struct Generics {
+        /// The left bracket.
+        pub lbrac: Loc,
+        /// The generics we are declaring.
+        pub generics: Vec<Generic>,
+        /// The right bracket.
+        pub rbrac: Loc,
+    }
+
+    #[derive(new, Debug, Clone, Getters)]
+    /// A single generic.
+    pub struct Generic {
+        /// The name of the generic.
+        pub name: Identifier,
+    }
+
+    /// A requirement to be satisfied
+    /// by a generic.
+    pub type Requirement = Identifier;
+
+    #[derive(new, Debug, Clone)]
+    /// One single generic.
+    pub enum GenericRequirement {
+        /// Generic must satisfy the specified
+        /// requirement.
+        /// 
+        /// Like: `T: Arithmetic`
+        Satisfies(Requirement),
+        /// Generic must not safisty the specified
+        /// requirement.
+        /// 
+        /// Like: `T: !Arithmetic`
+        DoesNotSafisfy(Requirement),
+        /// Generic must safisfy both requirements.
+        /// 
+        /// Like: `T: Arithmetic & !Comparable`
+        And {
+            /// The right hand side of the requirement.
+            lhs: Box<GenericRequirement>,
+            /// The ampersand that indicates it must
+            /// require both.
+            ampersand: Loc,
+            /// The right hand side of the requirement.
+            rhs: Box<GenericRequirement>,
+        },
+    }
+
+    /// The declaration of a requirement.
+    /// 
+    /// In the syntax `requirement $RequirementName $Generic = $BindingOfTyGeneric { $Expr }`.
+    /// 
+    /// This will be used to tell if a type used as generic is valid or not. For example, you
+    /// will be able to specify `func add[T: Arithmetic & !Comparable](lhs: T, rhs: T) T { return lhs + rhs; }`
+    /// where `Arithmetic` and `Comparable` are both requirements.
+    /// 
+    /// For example, `Arithmetic` could be declared as:
+    /// 
+    /// ```notest
+    /// # Declaring the Arithmetic generic requirement
+    /// requirement Arithmetic T = value { value + value - value * value / value % value }
+    /// 
+    /// # Using it later here
+    /// func add[T: Arithmetic](lhs: T, rhs: T) T {
+    ///     return lhs + rhs;
+    /// }
+    /// ```
+    /// 
+    /// Note that the function `add` fails to be instantiated if the requirement does
+    /// not pass.
+    pub struct RequirementDecl {
+        /// The `requirement` keyword.
+        requirement_kw: Loc,
+        /// The name of the requirement.
+        name: Identifier,
+        /// The equal sign.
+        eq: Loc,
+        /// The value to be bound.
+        bind: Identifier,
+        /// The left key token.
+        lkey: Loc,
+        /// The expression to be evaluated.
+        expr: Expr,
+        /// The right key token.
+        rkey: Loc,
+    }
+}
+
+pub mod tdecl {
+    /*!
+    
+    # The `tdecl` module
+
+    This module includes everything (or almost everything)
+    related to declaring custom types.
+
+    The plan is to support:
+
+    * [ ] Structs;
+    * [ ] Aliases; and
+    * [ ] Sum types.
+
+    Maybe even classes. Or unions.
+    Let's see.
+
+     */
+
+    use derive_new::new;
+
+    use super::{Identifier, Loc, Type};
+
+    #[derive(Debug, Clone, new)]
+    /// The declaration of a type.
+    pub struct TypeDecl {
+        /// The `type` keyword.
+        pub type_kw: Loc,
+        /// The name of the type.
+        pub name: Identifier,
+        /// The equal sign.
+        pub equal_sign: Loc,
+        /// The actual type.
+        pub ty: UserType,
+    }
+
+    #[derive(Debug, Clone, new, PartialEq)]
+    /// A type declared by the user.
+    pub enum UserType {
+        /// A struct type.
+        Struct {
+            /// The fields of the struct.
+            fields: Vec<(
+                Identifier,
+                Type,
+            )>,
+        },
+        //// An alias to another type.
+        Alias(Type),
     }
 }

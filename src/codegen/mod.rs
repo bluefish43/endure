@@ -19,4 +19,838 @@ check phase, and only generates based on what it's given.
 
 // start
 
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs::File,
+    io::{self, Write},
+    ops::Add,
+    path::Path,
+};
+
+use derive_getters::Getters;
+use inkwell::{
+    attributes::{Attribute, AttributeLoc}, builder::Builder, context::{AsContextRef, Context}, llvm_sys::{core::{LLVMAddAttributeAtIndex, LLVMCreateEnumAttribute, LLVMCreateTypeAttribute, LLVMGetEnumAttributeValue}, target::LLVMStoreSizeOfType, target_machine::LLVMGetHostCPUFeatures}, module::{Linkage, Module}, targets::{
+        CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine, TargetTriple
+    }, types::{AnyType, AnyTypeEnum, ArrayType, AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType}, values::{AnyValue, AnyValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue}, AddressSpace, OptimizationLevel
+};
+
+use crate::{
+    ast::{
+        expr::{BinaryOp, LiteralExpr},
+        typing::{PrimType, TypeBits},
+    },
+    check::hir::{
+        expr::{BinOpType, HIRAssignmentExpr, HIRBinaryExpr, HIRCallExpr, HIRExpr, HIRReturnExpr},
+        typing::HIRType,
+        HIRDecl, HIRFunctionDecl, HIRPrototype,
+    },
+};
+
+use self::llvm::Holder;
+
 mod llvm;
+
+#[repr(u32)]
+pub enum AttributeKind {
+    None = 0,
+    AllocAlign,
+    AllocatedPointer,
+    AlwaysInline,
+    Builtin,
+    Cold,
+    Convergent,
+    CoroDestroyOnlyWhenComplete,
+    DeadOnUnwind,
+    DisableSanitizerInstrumentation,
+    FnRetThunkExtern,
+    Hot,
+    ImmArg,
+    InReg,
+    InlineHint,
+    JumpTable,
+    MinSize,
+    MustProgress,
+    Naked,
+    Nest,
+    NoAlias,
+    NoBuiltin,
+    NoCallback,
+    NoCapture,
+    NoCfCheck,
+    NoDuplicate,
+    NoFree,
+    NoImplicitFloat,
+    NoInline,
+    NoMerge,
+    NoProfile,
+    NoRecurse,
+    NoRedZone,
+    NoReturn,
+    NoSanitizeBounds,
+    NoSanitizeCoverage,
+    NoSync,
+    NoUndef,
+    NoUnwind,
+    NonLazyBind,
+    NonNull,
+    NullPointerIsValid,
+    OptForFuzzing,
+    OptimizeForDebugging,
+    OptimizeForSize,
+    OptimizeNone,
+    PresplitCoroutine,
+    ReadNone,
+    ReadOnly,
+    Returned,
+    ReturnsTwice,
+    SExt,
+    SafeStack,
+    SanitizeAddress,
+    SanitizeHWAddress,
+    SanitizeMemTag,
+    SanitizeMemory,
+    SanitizeThread,
+    ShadowCallStack,
+    SkipProfile,
+    Speculatable,
+    SpeculativeLoadHardening,
+    StackProtect,
+    StackProtectReq,
+    StackProtectStrong,
+    StrictFP,
+    SwiftAsync,
+    SwiftError,
+    SwiftSelf,
+    WillReturn,
+    Writable,
+    WriteOnly,
+    ZExt,
+    ByRef,
+    ByVal,
+    ElementType,
+    InAlloca,
+    Preallocated,
+    StructRet,
+    Alignment,
+    AllocKind,
+    AllocSize,
+    Dereferenceable,
+    DereferenceableOrNull,
+    Memory,
+    NoFPClass,
+    StackAlignment,
+    UWTable,
+    VScaleRange,
+    LastIntAttr,
+}
+
+/// A file format to export the file as.
+pub enum ExportFormat {
+    // -- llvm specific formats
+    /// LLVM IR
+    LLVMIR,
+
+    /// LLVM Bitcode
+    LLVMBitCode,
+
+    /// An object file.
+    Object,
+
+    /// Endure's HIR representation.
+    HIR,
+
+    /// Text assembly.
+    Assembly,
+}
+
+/// The center of code generation.
+pub struct Emmitter<'c> {
+    /// What holds all of LLVM's essentials.
+    holder: Holder<'c>,
+    /// The current scope's variables.
+    scopes: RefCell<Vec<HashMap<String, AnyValueEnum<'c>>>>,
+}
+
+#[derive(Getters)]
+/// Options to use when exporting.
+pub struct ExportOptions<'a> {
+    /// The file format to export.
+    pub format: ExportFormat,
+    /// The output file name to use.
+    pub output: &'a str,
+    /// The optimization level to apply.
+    pub optimization_level: OptimizationLevel,
+    /// If we are using position-independent
+    /// code generation.
+    pub use_pie: bool,
+    /// The model of code to use.
+    /// 
+    /// This can be JIT, small, medium,
+    /// kernel and others.
+    pub code_model: CodeModel,
+    /// A specified target triple.
+    pub triple: Option<&'a str>,
+}
+
+impl<'c> Emmitter<'c> {
+    /// Constructs an `Emitter`.
+    pub fn new(context: &'c Context, module_name: &str) -> Self {
+        Self {
+            holder: Holder::from_context(context, module_name),
+            scopes: RefCell::default(),
+        }
+    }
+
+    pub fn dump(&'c self) {
+        self.module().print_to_stderr();
+    }
+
+    /// Exports the emitted LLVM IR to a file with the
+    /// specified file format.
+    pub fn export(
+        &'c self,
+        options: &ExportOptions<'c>
+    ) -> Result<(), io::Error> {
+        self.module().verify().unwrap();
+
+        let mut file = File::create(options.output())?;
+
+        match options.format() {
+            ExportFormat::LLVMIR => {
+                // write the llvm ir to the file
+                write!(file, "{}", self.module().print_to_string().to_string())?;
+            }
+            ExportFormat::LLVMBitCode => {
+                // write the llvm bitcode to the file
+                file.write_all(self.module().write_bitcode_to_memory().as_slice())?;
+            }
+            ExportFormat::Object
+            | ExportFormat::Assembly => {
+                // initialize target
+                Target::initialize_native(&InitializationConfig::default()).map_err(|_| {
+                    io::Error::other(
+                        "Failed to initialize native target".to_string()
+                    )
+                })?;
+                let relocation_mode = if *options.use_pie() {
+                    RelocMode::PIC
+                } else {
+                    RelocMode::Default
+                };
+                let code_model = *options.code_model();
+                let out_path = Path::new(options.output());
+                let triple = match options.triple() {
+                    Some(triple) => {
+                        TargetTriple::create(triple)
+                    }
+                    None => {
+                        TargetMachine::get_default_triple()
+                    }
+                };
+                let target = Target::from_triple(&triple)
+                    .map_err(
+                        |err| {
+                            io::Error::other(
+                                err.to_string()
+                            )
+                        }
+                    )?;
+                let cpu = TargetMachine::get_host_cpu_name().to_string();
+                let features = TargetMachine::get_host_cpu_features().to_string();
+                let target_machine = target
+                    .create_target_machine(
+                        &triple,
+                        &cpu,
+                        &features,
+                        options.optimization_level,
+                        relocation_mode,
+                        code_model
+                    ).ok_or(
+                        io::Error::other(
+                            "Failed to get target machine".to_string()
+                        )
+                    )?;
+
+                target_machine
+                    .write_to_file(
+                        self.module(),
+                        if let ExportFormat::Object = options.format {
+                            FileType::Object
+                        } else {
+                            FileType::Assembly
+                        },
+                        out_path
+                    )
+                    .map_err(|err| {
+                        io::Error::other(err.to_string())
+                    })?;
+            }
+            ExportFormat::HIR => unimplemented!(),
+        }
+
+        Ok(())
+    }
+
+    /// Emmits machine code for a program.
+    pub fn emmit_program(&'c self, decls: &[HIRDecl]) {
+        for decl in decls.iter() {
+            self.emmit_decl(decl)
+        }
+    }
+
+    /// Emmits machine code for a declaration in High Level IR.
+    fn emmit_decl(&'c self, decl: &HIRDecl) {
+        match decl {
+            HIRDecl::FunctionDecl(hir_function_decl) => self.emmit_func_decl(hir_function_decl),
+        }
+    }
+
+    /// Emits machine code for an HIR function declaration.
+    fn emmit_func_decl(&'c self, decl: &HIRFunctionDecl) {
+        let (function_type, param_attrs) = self.func_type_of_proto(&decl.prototype);
+
+        let function_value = self.get_or_define(decl.prototype.name(), function_type);
+
+        // add parameter attributes
+        for (param_idx, param_attr) in param_attrs {
+            function_value.add_attribute(
+                AttributeLoc::Param(param_idx as u32),
+                param_attr,
+            )
+        }
+        
+        let block = self.context().append_basic_block(function_value, "");
+        self.builder().position_at_end(block);
+
+        self.push_scope();
+
+        for decl in decl.block.stmts().iter() {
+            self.emmit_expr(decl);
+        }
+
+        self.pop_scope();
+    }
+
+    /// Gets or defines a function if not yet defined.
+    fn get_or_define(&self, func: &str, ty: FunctionType<'c>) -> FunctionValue<'c> {
+        match self.holder.module().get_function(func) {
+            Some(func) => func,
+            None => self
+                .holder
+                .module()
+                .add_function(func, ty, Some(Linkage::External)),
+        }
+    }
+
+    /// Gets the function type of a prototype.
+    fn func_type_of_proto(&'c self, proto: &HIRPrototype) -> (FunctionType<'c>, Vec<(usize, Attribute)>) {
+        let mut args = vec![];
+        let mut attrs = vec![];
+        let mut add_index = 0;
+
+        // if returns aggregate, use void and take
+        // return parameter instead
+        let return_type = if let HIRType::Struct(_) = &**proto.return_type() {
+            args.push(
+                self.context()
+                    .i32_type()
+                    .ptr_type(AddressSpace::default())
+                    .as_basic_type_enum()
+                    .into()
+            );
+            attrs.push((0,
+                unsafe { Attribute::new(
+                    LLVMCreateEnumAttribute(self.context().as_ctx_ref(), AttributeKind::WriteOnly as u32, 1)
+                ) }
+            ));
+            add_index += 1;
+
+            self.context()
+                .i32_type()
+                .into()
+        } else {
+            self.llvm_type(&proto.return_type())
+        };
+
+        for (idx, arg) in proto.arguments().iter().enumerate() {
+            let (arg_ty, arg_attr) = self.llvm_type_argument(&arg.ty);
+            args.push(basic_type(arg_ty).into());
+            if let Some(attr) = arg_attr {
+                attrs.push(
+                    (idx + add_index,
+                    attr)
+                )
+            }
+        }
+
+        (
+            basic_type(return_type).fn_type(args.as_slice(), false),
+            attrs
+        )
+    }
+
+    /// Gets a type in LLVM for its representation in HIR.
+    fn llvm_type(&'c self, ty: &HIRType) -> AnyTypeEnum<'c> {
+        use HIRType as HT;
+        use PrimType as PT;
+        use TypeBits as TB;
+
+        match ty {
+            HT::Primitive { loc, ty } => match ty {
+                PT::Bool => self.holder.context().bool_type().into(),
+                PT::Float(bits) => match bits {
+                    TB::B32 => self.holder.context().f32_type(),
+                    TB::B64 => self.holder.context().f64_type(),
+                    _ => unreachable!(),
+                }
+                .into(),
+                PT::Int(bits) | PT::UInt(bits) => match bits {
+                    TB::B8 => self.holder.context().i8_type(),
+                    TB::B16 => self.holder.context().i16_type(),
+                    TB::B32 => self.holder.context().i32_type(),
+                    TB::B64 => self.holder.context().i64_type(),
+                }
+                .into(),
+            },
+            HT::SizedArray { size, element_type } => {
+                BasicTypeEnum::try_from(self.llvm_type(&element_type))
+                    .unwrap()
+                    .array_type(size.1 as u32)
+                    .as_any_type_enum()
+            }
+            HT::Struct(fields) => {
+                self.context()
+                    .struct_type(
+                        fields.iter()
+                            .map(|ty| {
+                                basic_type(
+                                    self.llvm_type(ty)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                        false
+                    )
+                    .as_any_type_enum()
+            }
+            HT::Pointer { pointee, mutability } => BasicTypeEnum::try_from(self.llvm_type(&pointee))
+                .unwrap()
+                .ptr_type(AddressSpace::default())
+                .as_any_type_enum(),
+            HT::FunctionPointer(proto) => self.func_type_of_proto(proto).0.as_any_type_enum(),
+            HT::Void => self.holder.context().void_type().as_any_type_enum(),
+            HT::Universe => unreachable!("Universe type here is an error in type checker"),
+        }
+    }
+
+    /// Gets a type in LLVM for its representation in HIR
+    /// for a function argument.
+    fn llvm_type_argument(&'c self, ty: &HIRType) -> (AnyTypeEnum<'c>, Option<Attribute>) {
+        use HIRType as HT;
+        use PrimType as PT;
+        use TypeBits as TB;
+
+        match ty {
+            HT::Struct(fields) => {
+                // create struct type
+                let struct_type = self.context()
+                    .struct_type(
+                        fields.iter()
+                            .map(|ty| {
+                                basic_type(
+                                    self.llvm_type(ty)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                        false
+                    )
+                    .as_basic_type_enum();
+                // create byval(Struct) attribute
+                let by_val_attribute = unsafe {
+                    Attribute::new(
+                        LLVMCreateTypeAttribute(self.context().as_ctx_ref(), AttributeKind::ByVal as u32, struct_type.as_type_ref())
+                    )
+                };
+
+                (struct_type.ptr_type(AddressSpace::default()).as_any_type_enum(), Some(by_val_attribute))
+            }
+            _ => (self.llvm_type(ty), None),
+        }
+    }
+
+    fn push_scope(&self) {
+        self.scopes.borrow_mut().push(Default::default());
+    }
+
+    fn pop_scope(&self) {
+        self.scopes.borrow_mut().pop();
+    }
+
+    /// Emmits machine code for the input expression.
+    fn emmit_expr(&'c self, expr: &HIRExpr) -> AnyValueEnum<'c> {
+        self.emmit_expr_impl(expr, false)
+    }
+
+    fn emmit_expr_impl(&'c self, expr: &HIRExpr, take_lvalue: bool) -> AnyValueEnum<'c> {
+        use HIRExpr as HE;
+
+        match expr {
+            HE::AsReference(other) => self.emmit_expr_impl(&other.1, true),
+            HE::Literal(lit) => self.emmit_lit(lit),
+            HE::Binary(bin) => self.emmit_bin(bin),
+            HE::Assignment(assignment) => {
+                self.emmit_assignment(assignment);
+                self.const_null()
+            }
+            HE::SlotDecl(to, ty) => {
+                let ty = basic_type(self.llvm_type(ty));
+                let mem = self.builder().build_alloca(ty, "").unwrap();
+                self.set_var(to, mem.as_any_value_enum());
+                mem.as_any_value_enum()
+            }
+            HE::Call(call_expr) => self.emmit_call(call_expr),
+            HE::Variable(var, vty) => {
+                if take_lvalue {
+                    self.get_var(var.as_str())
+                } else {
+                    self.builder()
+                        .build_load(
+                            basic_type(self.llvm_type(vty)),
+                            self.get_var(var.as_str()).into_pointer_value(),
+                            "",
+                        )
+                        .unwrap()
+                        .as_any_value_enum()
+                }
+            }
+            HE::AccessProperty { struct_expr, struct_ty, property_index, property_ty, must_dereference_struct } => {
+                let struct_value = if *must_dereference_struct {
+                    self.builder()
+                        .build_load(
+                            self.context().i32_type().ptr_type(AddressSpace::default()),
+                            self.emmit_expr_impl(&struct_expr, true).into_pointer_value(),
+                            ""
+                        )
+                        .unwrap()
+                        .as_any_value_enum()
+                } else {
+                    self.emmit_expr_impl(&struct_expr, true)
+                };
+                let struct_type = self.llvm_type(struct_ty);
+                let property_type = self.llvm_type(property_ty);
+
+                let address = self.builder()
+                    .build_struct_gep(
+                        basic_type(struct_type),
+                        struct_value.into_pointer_value(),
+                        *property_index,
+                        ""
+                    )
+                    .unwrap();
+
+                if take_lvalue {
+                    address.as_any_value_enum()
+                } else {
+                    self.builder()
+                        .build_load(
+                            basic_type(property_type),
+                            address,
+                            ""
+                        )
+                        .unwrap()
+                        .as_any_value_enum()
+                }
+            }
+            HE::Argument { name, ty, index } => {
+                if let Some(argument_val) = self.get_var_opt(name.as_str()) {
+                    argument_val
+                } else {
+                    // get the type of param
+                    let arg_type = basic_type(self.llvm_type(ty));
+                    // get the function we're working on
+                    let current_function = self.builder()
+                        .get_insert_block()
+                        .unwrap()
+                        .get_parent()
+                        .unwrap();
+                    // get the argument
+                    let argument = current_function
+                        .get_nth_param(*index as u32)
+                        .unwrap();
+                    // create local binding
+                    let local_argument = self.builder()
+                        .build_alloca(arg_type, "")
+                        .unwrap();
+
+                    // store the value inside of the local binding
+                    if !arg_type.is_struct_type() {
+                        // use store if regular type
+                        self.builder()
+                            .build_store(
+                                local_argument, argument
+                            )
+                            .unwrap();
+                    } else {
+                        // otherwise use memcpy
+                        self.builder()
+                            .build_memcpy(
+                                local_argument,
+                                8,
+                                argument.into_pointer_value(),
+                                8,
+                                arg_type.size_of().unwrap(),
+                            )
+                            .unwrap();
+                    }
+                    // set the argument's value locally
+                    self.set_var(name.as_str(), local_argument.as_any_value_enum());
+                    // return the allocated value for the argument
+                    local_argument.as_any_value_enum()
+                }
+            }
+            HE::GlobalFunc(name, proto) => {
+                let (func_ty, func_attrs) = self.func_type_of_proto(proto);
+                let func = self
+                    .get_or_define(&name, func_ty);
+                for (param_idx, param_attr) in func_attrs {
+                    func.add_attribute(AttributeLoc::Param(param_idx as u32), param_attr)
+                }
+                func.as_any_value_enum()
+            }
+            HE::DefineAndEval(define, expr) => {
+                let insert_point = self.builder()
+                    .get_insert_block()
+                    .unwrap();
+                self.emmit_decl(define);
+                self.builder()
+                    .position_at_end(insert_point);
+                self.emmit_expr(&expr)
+            }
+            HE::Dereference(pointee, pointer) => {
+                self.builder()
+                    .build_load(
+                        basic_type(self.llvm_type(pointee)),
+                        self.emmit_expr(&pointer).into_pointer_value(),
+                        ""
+                    )
+                    .unwrap()
+                    .as_any_value_enum()
+            }
+            HE::InstantiateStruct(ty, fields) => self.emmit_instantiate_struct(ty, fields),
+            HE::Return(ret_expr) => self.emmit_ret(ret_expr),
+            // TODO: Implement conditionals and while loops
+            HE::Conditional(cond) => todo!("Conditionals are not yet implemented"),
+            HE::WhileLoop(loo) => todo!("While loops are not yet implemented"),
+        }
+    }
+
+    /// Emmits a literal as machine code.
+    fn emmit_lit(&'c self, lit: &LiteralExpr) -> AnyValueEnum<'c> {
+        match lit {
+            LiteralExpr::Int(i) => self.holder.context().i64_type().const_int(i.1 as u64, true),
+        }
+        .as_any_value_enum()
+    }
+
+    /// Emits a binary expression.
+    fn emmit_bin(&'c self, expr: &HIRBinaryExpr) -> AnyValueEnum<'c> {
+        let lhs = basic_value(self.emmit_expr(&expr.left_hand_side));
+        let rhs = basic_value(self.emmit_expr(&expr.right_hand_side));
+        match expr.op.1 {
+            BinaryOp::Plus => match expr.op_ty {
+                BinOpType::Int | BinOpType::UInt => self
+                    .builder()
+                    .build_int_add(lhs.into_int_value(), rhs.into_int_value(), "")
+                    .unwrap()
+                    .into(),
+                BinOpType::Float => self
+                    .builder()
+                    .build_float_add(lhs.into_float_value(), rhs.into_float_value(), "")
+                    .unwrap()
+                    .into(),
+            },
+        }
+    }
+
+    /// Emmits the instantiation of a struct.
+    fn emmit_instantiate_struct(&'c self, hir_stct_ty: &HIRType, fields: &[HIRExpr]) -> AnyValueEnum<'c> {
+        let stct_ty = basic_type(self.llvm_type(hir_stct_ty));
+        // allocate memory for the struct
+        let stct_mem = self.builder()
+            .build_alloca(stct_ty, "")
+            .unwrap();
+        // set the values of the structs
+        for (index, field) in fields.iter().enumerate() {
+            let field_address = self.builder()
+                .build_struct_gep(
+                    stct_ty,
+                    stct_mem,
+                    index as u32,
+                    ""
+                )
+                .unwrap();
+            let field_value = basic_value(self.emmit_expr(field));
+            self.builder()
+                .build_store(
+                    field_address,
+                    field_value
+                )
+                .unwrap();
+        }
+        stct_mem.as_any_value_enum()
+    }
+
+    /// Emmits machine code for an assignment.
+    fn emmit_assignment(&'c self, assignment: &HIRAssignmentExpr) {
+        let lhs = basic_value(self.emmit_expr_impl(&assignment.0.left_hand_side, true));
+
+        if let Some(aggr_ty) = &assignment.1 {
+            // do memcpy if assigning to aggregate type
+            let value = basic_value(self.emmit_expr_impl(&assignment.0.right_hand_side, true));
+            // get size of type
+            let size = self.llvm_type(&aggr_ty)
+                .size_of()
+                .unwrap();
+            // make memcpy
+            self.builder()
+                .build_memcpy(
+                    lhs.into_pointer_value(),
+                    8,
+                    value.into_pointer_value(),
+                    8,
+                    size,
+                )
+                .unwrap();
+        } else {
+            // else don't
+            let rhs = basic_value(self.emmit_expr_impl(&assignment.0.right_hand_side, false));
+            self.builder()
+                .build_store(lhs.into_pointer_value(), rhs)
+                .unwrap();
+        }
+    }
+
+    /// Emmits a call to a function.
+    fn emmit_call(&'c self, call: &HIRCallExpr) -> AnyValueEnum<'c> {
+        let callee = self.emmit_expr(&call.callee);
+        let mut params = vec![];
+
+        for param in call.params.iter() {
+            params.push(basic_value(self.emmit_expr(param)).into());
+        }
+
+        self.builder()
+            .build_call(callee.into_function_value(), &params, "")
+            .unwrap()
+            .as_any_value_enum()
+    }
+
+    /// Emmits a return instruction.
+    fn emmit_ret(&'c self, expr: &HIRReturnExpr) -> AnyValueEnum<'c> {
+        if let Some(aggr_ty) = &expr.aggregate {
+            // aggregate return
+            let value = if let Some(val) = &expr.expr {
+                basic_value(self.emmit_expr_impl(&val, true))
+            } else {
+                unreachable!()
+            };
+            // get size of type
+            let size = self.llvm_type(&aggr_ty)
+                .size_of()
+                .unwrap();
+            // make memcpy
+            self.builder()
+                .build_memcpy(
+                    self.builder()  
+                        .get_insert_block()
+                        .unwrap()
+                        .get_parent()
+                        .unwrap()
+                        .get_nth_param(0)
+                        .unwrap()
+                        .into_pointer_value(),
+                    8,
+                    value.into_pointer_value(),
+                    8,
+                    size,
+                )
+                .unwrap();
+            self.builder()
+                .build_return(Some(
+                    &self.context().i32_type().const_int(0, false).as_basic_value_enum() as &dyn BasicValue<'c>
+                ))
+                .unwrap();
+            self.const_null()
+        } else {
+            // normal return
+            let value: Option<Box<dyn BasicValue>> = if let Some(val) = &expr.expr {
+                Some(Box::new(basic_value(self.emmit_expr(&val))))
+            } else {
+                None
+            };
+            self.builder()
+                .build_return(value.as_ref().map(|v| v.as_ref()))
+                .unwrap();
+            self.const_null()
+        }
+    }
+
+    /// Builds a const null pointer.
+    fn const_null(&'c self) -> AnyValueEnum<'c> {
+        self.builder()
+            .build_int_to_ptr(
+                self.context().i8_type().const_int(0, false),
+                self.context().i8_type().ptr_type(AddressSpace::default()),
+                "",
+            )
+            .unwrap()
+            .into()
+    }
+
+    /// Sets a variable in the current scope.
+    fn set_var(&'c self, s: &str, val: AnyValueEnum<'c>) {
+        self.scopes
+            .borrow_mut()
+            .last_mut()
+            .unwrap()
+            .insert(s.to_string(), val);
+    }
+
+    /// Gets a variable from the list of scopes.
+    fn get_var(&'c self, s: &str) -> AnyValueEnum<'c> {
+        self.get_var_opt(s).unwrap()
+    }
+
+    /// Gets a variable from the list of scopes.
+    fn get_var_opt(&'c self, s: &str) -> Option<AnyValueEnum<'c>> {
+        for scope in self.scopes.borrow().iter() {
+            if let Some(val) = scope.get(s) {
+                return Some(*val);
+            }
+        }
+
+        None
+    }
+
+    fn builder(&'c self) -> &'c Builder<'c> {
+        self.holder.builder()
+    }
+    fn context(&'c self) -> &'c Context {
+        self.holder.context()
+    }
+    fn module(&'c self) -> &'c Module<'c> {
+        self.holder.module()
+    }
+}
+
+/// Creates a basic type enum from an any type enum.
+fn basic_type(an: AnyTypeEnum) -> BasicTypeEnum {
+    BasicTypeEnum::try_from(an).unwrap()
+}
+
+/// Creates a basic value enum from an any value enum.
+fn basic_value(an: AnyValueEnum) -> BasicValueEnum {
+    BasicValueEnum::try_from(an).unwrap()
+}

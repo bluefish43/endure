@@ -78,15 +78,17 @@ pub mod expr {
 
     use derive_new::new;
 
-    use crate::ast::{expr::{BinaryOp, LiteralExpr}, IntLit, Loc};
+    use crate::ast::{
+        expr::{BinaryOp, LiteralExpr}, Identifier, IntLit, Loc
+    };
 
     pub type HIRIdentifier = String;
 
-    use super::{HIRBlock, HIRType};
+    use super::{HIRBlock, HIRDecl, HIRPrototype, HIRType};
 
     #[derive(Debug)]
     /// A while loop.
-    pub struct HIRWhileLoop{
+    pub struct HIRWhileLoop {
         pub while_kw: Loc,
         pub condition: Box<HIRExpr>,
         pub block: HIRBlock,
@@ -94,17 +96,14 @@ pub mod expr {
 
     #[derive(Debug)]
     /// A conditional expression
-    pub struct HIRConditional{
+    pub struct HIRConditional {
         pub if_kw: Loc,
         pub condition: Box<HIRExpr>,
         pub then: HIRBlock,
-        pub else_part: Option<(
-            Loc,
-            HIRBlock,
-        )>,
+        pub else_part: Option<(Loc, HIRBlock)>,
     }
 
-    #[derive(Debug, )]
+    #[derive(Debug, new)]
     /// An expression which can be used
     /// as a value or not.
     pub enum HIRExpr {
@@ -115,15 +114,56 @@ pub mod expr {
         SlotDecl(HIRIdentifier, HIRType),
         Call(HIRCallExpr),
         /// The use of a variable as an expression.
-        Variable(HIRIdentifier),
+        Variable(HIRIdentifier, HIRType),
+        /// The use of an argument as an expression.
+        Argument {
+            name: HIRIdentifier,
+            ty: HIRType,
+            index: usize,
+        },
+        /// Gets the property at the specified index of the
+        /// specified structural type at the specified index.
+        AccessProperty {
+            /// The struct expression.
+            struct_expr: Box<HIRExpr>,
+            /// The struct type.
+            struct_ty: HIRType,
+            /// The index of the property within the struct.
+            property_index: u32,
+            /// The type of the property.
+            property_ty: HIRType,
+            /// If the compiler must load the struct before accessing
+            /// its property (in case for a pointer to struct type)
+            /// 
+            /// Note: As we don't have a special -> operator, we use
+            /// this to indicate whether one or another should be used.
+            /// 
+            /// If we must load it first, it is equivalent to ->, otherwise
+            /// it is equivalent to ".".
+            must_dereference_struct: bool,
+        },
         /// The use of a global function as a symbol.
-        GlobalFunc(HIRIdentifier),
+        ///
+        /// Note: we store the prototype here because
+        /// we may need to declare it previously as
+        /// the order of declaration doesn't matter
+        /// in our language.
+        GlobalFunc(HIRIdentifier, HIRPrototype),
         Return(HIRReturnExpr),
         Conditional(HIRConditional),
         WhileLoop(HIRWhileLoop),
+        /// Defines this before evaluating the following expression.
+        DefineAndEval(HIRDecl, Box<HIRExpr>),
+        /// The instantiation of a struct.
+        /// 
+        /// We have here the type of the struct and the types of
+        /// its fields.
+        InstantiateStruct(HIRType, Vec<HIRExpr>),
+        /// Dereferences a pointer.
+        Dereference(HIRType, Box<HIRExpr>),
     }
 
-    #[derive(Debug, )]
+    #[derive(Debug)]
     /// A special type of expression in which,
     /// if available, returns an lvalue instead
     /// of an rvalue.
@@ -156,11 +196,14 @@ pub mod expr {
     /// This changes it to these new rules:
     /// * The left hand side must be an lvalue OR must
     ///   support having its reference taken;
-    #[repr(transparent)]
-    #[derive(Debug, )]
-    pub struct HIRAssignmentExpr(pub HIRBinaryExpr);
+    /// 
+    /// This also contains a flag indicating if we're
+    /// assigning to an aggregate type or not and if we
+    /// are, the aggregate type we're assigning.
+    #[derive(Debug)]
+    pub struct HIRAssignmentExpr(pub HIRBinaryExpr, pub Option<HIRType>);
 
-    #[derive(Debug, )]
+    #[derive(Debug)]
     /// The type of binary operation.
     pub enum BinOpType {
         /// An integer operation.
@@ -171,7 +214,7 @@ pub mod expr {
         Float,
     }
 
-    #[derive(Debug, )]
+    #[derive(Debug)]
     /// A binary expression is formed by the
     /// left hand side (the left side of the
     /// binary operator), the binary operator
@@ -199,6 +242,7 @@ pub mod expr {
     pub struct HIRReturnExpr {
         pub ret_kw: Loc,
         pub expr: Option<Box<HIRExpr>>,
+        pub aggregate: Option<HIRType>,
     }
 
     #[derive(Debug, new)]
@@ -231,7 +275,7 @@ pub mod typing {
 
     use crate::ast::{typing::PrimType, IntLit};
 
-    use super::{HIRIdentifier, Loc, HIRPrototype};
+    use super::{HIRIdentifier, HIRPrototype, Loc};
 
     /*
 
@@ -252,7 +296,7 @@ pub mod typing {
 
     #[derive(Debug, Clone, new)]
     /// Any of the supported types.
-    /// 
+    ///
     /// No named types 'cause they're all
     /// inlined now.
     pub enum HIRType {
@@ -273,7 +317,12 @@ pub mod typing {
         },
         /// It's essentially a pointer, but we
         /// may add special checkings in the future.
-        Pointer(Box<HIRType>),
+        Pointer {
+            pointee: Box<HIRType>,
+            mutability: Option<Loc>,
+        },
+        /// A structural type and its fields.
+        Struct(Vec<HIRType>),
         /// A pointer to a function.
         FunctionPointer(HIRPrototype),
         /// The void     type.
@@ -288,12 +337,9 @@ pub mod typing {
         pub fn is_trivially_copyable(&self) -> bool {
             match self {
                 Self::Primitive { .. } => true,
-                Self::SizedArray { element_type, .. } => {
-                    element_type.is_trivially_copyable()
-                }
-                Self::Void
-                | Self::Universe => true,
-                _ => false
+                Self::SizedArray { element_type, .. } => element_type.is_trivially_copyable(),
+                Self::Void | Self::Universe => true,
+                _ => false,
             }
         }
     }
@@ -309,7 +355,7 @@ pub mod typing {
                 (_, Self::Universe) => true,
                 (Self::Primitive { ty, .. }, Self::Primitive { ty: ty2, .. }) => ty == ty2,
                 (Self::Void, Self::Void) => true,
-                (Self::Pointer(pointee1), Self::Pointer(pointee2)) => pointee1 == pointee2,
+                (Self::Pointer { pointee, mutability }, Self::Pointer { pointee: pointee2, mutability: mutability2 }) => pointee == pointee2 && mutability.is_some() == mutability2.is_some(),
                 _ => false,
             }
         }
