@@ -25,7 +25,7 @@ mod namespaces;
 mod scopes;
 
 use std::{
-    cell::RefCell, collections::HashMap, fmt::Display, ops::{Add, BitAnd, BitAndAssign, BitOr}, rc::Rc
+    cell::RefCell, collections::HashMap, ops::{BitAnd, BitAndAssign}, rc::Rc
 };
 
 use ansi_term::Color;
@@ -36,11 +36,11 @@ use either::Either;
 use crate::{
     ast::{
         expr::{
-            self, AsReferenceExpr, AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Conditional,
+            AsReferenceExpr, AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Conditional,
             Expr, LiteralExpr, ReturnExpr, WhileLoop,
-        }, generics::Generic, tdecl::{TypeDecl, UserType}, typing::{NameIndex, PrimType, Type, TypeBits}, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, NamespaceDecl, Prototype
+        }, generics::Generic, matcher::{Case, Pattern, Switch}, tdecl::{Struct, TypeDecl, UserType}, typing::{NameIndex, PrimType, Type, TypeBits}, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, Mutability, NamespaceDecl, Prototype
     },
-    check::{hir::HIRArgument, namespaces::Member},
+    check::{hir::{expr::HIRLiteralExpr, HIRArgument}, namespaces::Member},
 };
 
 use self::{
@@ -49,9 +49,7 @@ use self::{
         expr::{
             BinOpType, HIRAsReferenceExpr, HIRAssignmentExpr, HIRBinaryExpr, HIRCallExpr,
             HIRConditional, HIRExpr, HIRReturnExpr, HIRWhileLoop,
-        },
-        typing::HIRType,
-        HIRBlock, HIRDecl, HIRFunctionDecl, HIRPrototype,
+        }, matcher::{HIRCase, HIRPattern, HIRSwitch}, typing::HIRType, HIRBlock, HIRDecl, HIRFunctionDecl, HIRPrototype
     },
     namespaces::{AddMemberError, WeakNamespace},
     scopes::Variable,
@@ -97,7 +95,7 @@ pub struct GenericFunction {
     /// The definition of the function.
     decl: FunctionDecl,
     /// The instantiated types.
-    instantiated: Vec<Vec<Type>>,
+    instantiated: Vec<(Vec<Type>, GenericFunction, HIRPrototype, Prototype)>,
     /// The namespace where the function
     /// is defined.
     ///
@@ -368,8 +366,9 @@ impl Checker {
 
         // starts the processing of the block
         self.ctx
-            .add_function_scope(prototype.arguments(), *prototype.unsafety());
-        let (reachability, hirblock) = self.pass_block(block)?;
+            .add_function_scope(prototype.receiver().as_ref(), prototype.arguments(), *prototype.unsafety());
+
+        let (reachability, hirblock) = self.pass_block(block, false)?;
 
         if reachability.reachable() {
             if **prototype.return_type() != Type::Void {
@@ -398,7 +397,8 @@ impl Checker {
             UserType::Alias(alias) => {
                 self.pass_ty(alias.clone());
             },
-            UserType::Struct { fields } => {
+            UserType::Struct(Struct { fields })
+            | UserType::Union(fields) => {
                 let mut occurred_fields = vec![];
 
                 for (field_name, field_ty) in fields.iter() {
@@ -407,6 +407,11 @@ impl Checker {
                             CheckerError::StructFieldRedefinition {
                                 name: name.clone(),
                                 field: field_name.clone(),
+                                for_: if matches!(ty, UserType::Struct(_)) {
+                                    "struct"
+                                } else {
+                                    "union"
+                                }
                             }
                         );
                     } else {
@@ -414,7 +419,7 @@ impl Checker {
                         self.pass_ty(field_ty.clone());
                     }
                 }
-            }
+            },
         }
     }
 
@@ -429,8 +434,6 @@ impl Checker {
         namespace_decl: &NamespaceDecl,
         root: bool,
     ) -> Vec<HIRDecl> {
-        // TODO: Implement namespace declaration typechecking
-
         let mut output = vec![];
 
         if root {
@@ -457,17 +460,22 @@ impl Checker {
 
     /// Passes through a block and returns if
     /// anything is reachable after it.
-    fn pass_block(&mut self, block: &Block) -> Option<(Reachability, HIRBlock)> {
+    fn pass_block(&mut self, block: &Block, add_scope: bool) -> Option<(Reachability, HIRBlock)> {
         let mut reachable = Reachability::Reachable;
         let mut hirblock_contents = vec![];
         let mut altered = false;
+
+        if add_scope {
+            self.ctx.add_normal_scope(false);
+        }
+
         for expr in block.stmts().iter() {
             if let Reachability::Unreachable = reachable {
                 // unreachable code found
                 self.add_error(CheckerError::StmtIsUnreachable(expr.loc()));
                 break;
             }
-            match self.pass_expr(expr, ExprState::IsStmt) {
+            match self.pass_expr(expr, ExprState::IsStmt, None) {
                 Some((_, reachability, hirexpr)) => {
                     if let Reachability::Unreachable = reachability {
                         reachable = Reachability::Unreachable
@@ -479,6 +487,11 @@ impl Checker {
                 }
             }
         }
+
+        if add_scope {
+            self.ctx.pop_scope();
+        }
+
         if !altered {
             Some((reachable, HIRBlock::new(hirblock_contents)))
         } else {
@@ -488,10 +501,7 @@ impl Checker {
 
     /// Validates a prototype.
     fn pass_proto(&mut self, proto: &Prototype, func: &ActFunction) -> Option<HIRPrototype> {
-        // TODO: Type check the prototype
-
         let Prototype {
-            name,
             arguments,
             return_type,
             ..
@@ -500,6 +510,18 @@ impl Checker {
         let mut error = false;
 
         let mut new_arguments = vec![];
+
+        if let Some(receiver) = proto.receiver() {
+            new_arguments.push(
+                HIRArgument::new(
+                    self.collection
+                        .unwrap_get(receiver.receiver_name().1)
+                        .to_string(),
+                    self.pass_ty((**receiver.ty()).clone())?,
+                )
+            );
+        }
+
         for argument in arguments {
             if let Some(argument_ty) = self.pass_ty(argument.ty.clone()) {
                 new_arguments.push(HIRArgument::new(
@@ -535,9 +557,8 @@ impl Checker {
             Type::SizedArray {
                 left_bracket,
                 size,
-                of,
                 element_type,
-                right_bracket,
+                ..
             } => {
                 // array of zero sized elements is not allowed
                 if self.is_valueless_type(&element_type) {
@@ -547,7 +568,7 @@ impl Checker {
                     ));
 
                     None
-                } else if size.1.is_negative() {
+                } else if size.1 {
                     self.add_error(CheckerError::NegativeSizedArray(size.0.clone(), size));
 
                     None
@@ -569,7 +590,7 @@ impl Checker {
                 }
             }
             Type::Universe => Some(HIRType::new_universe()),
-            Type::Pointer { pointee, mutability } => Some(HIRType::new_pointer(
+            Type::Pointer { pointee, mutability, lifetime: _ } => Some(HIRType::new_pointer(
                 Box::new(self.pass_ty(*pointee)?),
                 mutability.clone(),
             )),
@@ -580,14 +601,23 @@ impl Checker {
                         UserType::Alias(to) => {
                             self.pass_ty(to.clone())
                         }
-                        UserType::Struct { fields } => {
+                        UserType::Struct(Struct { fields }) => {
                             let mut hir_fields = Vec::with_capacity(fields.len());
 
                             for (_, field_ty) in fields.iter(){ 
                                 hir_fields.push(self.pass_ty(field_ty.clone())?);
                             }
 
-                            Some(HIRType::Struct(hir_fields))
+                            Some(HIRType::Struct(hir_fields).into_aligned(std::mem::size_of::<usize>()))
+                        }
+                        UserType::Union(fields) => {
+                            let mut hir_fields = Vec::with_capacity(fields.len());
+
+                            for (_, field_ty) in fields.iter(){ 
+                                hir_fields.push(self.pass_ty(field_ty.clone())?);
+                            }
+
+                            Some(HIRType::Union(hir_fields))
                         }
                     }
                 } else {
@@ -598,7 +628,7 @@ impl Checker {
                     None
                 }
             }
-            Type::Instantiated { name, lbrac, instantiated, rbrac } => {
+            Type::Instantiated { .. } => {
                 // TODO: Implement instantiated named types
                 unimplemented!()
             }
@@ -607,8 +637,8 @@ impl Checker {
 
     /// Passes through an expression which gives out
     /// an error if the expression is unreachable.
-    fn pass_reachable_expr(&mut self, expr: &Expr, state: ExprState) -> Option<(Type, HIRExpr)> {
-        let res = self.pass_expr(expr, state)?;
+    fn pass_reachable_expr(&mut self, expr: &Expr, state: ExprState, expected_type: Option<Type>) -> Option<(Type, HIRExpr)> {
+        let res = self.pass_expr(expr, state, expected_type)?;
 
         if let Reachability::Unreachable = res.1 {
             self.add_error(CheckerError::UsingUnreachableExprAsVal(expr.loc()));
@@ -624,8 +654,10 @@ impl Checker {
         &mut self,
         expr: &Expr,
         state: ExprState,
+        expected_type: Option<Type>,
     ) -> Option<(Type, Reachability, HIRExpr)> {
         let prim: Option<(Type, HIRExpr)> = match expr {
+            Expr::Let { mutable, loc_or_let, name, ty, eq, expr } => self.pass_let_expr(*mutable, loc_or_let, name, ty.as_ref(), eq, expr),
             Expr::AsReference(asref) => {
                 if matches!(state, ExprState::IsStmt) {
                     self.add_error(CheckerError::InvalidExpressionAsStatement(
@@ -645,7 +677,7 @@ impl Checker {
                     ));
                     None
                 } else {
-                    self.pass_lit_expr(lit)
+                    self.pass_lit_expr(lit, expected_type)
                 }
             }
             Expr::Dereference(deref, base) => {
@@ -671,7 +703,10 @@ impl Checker {
                 }
             }
             Expr::GenericInstantiation(name, templates) => self.pass_generic_instantiation(name, templates),
-            Expr::AccessProperty(base, dot, prop) => self.pass_access_property(base, dot.clone(), prop),
+            Expr::AccessProperty(base, dot, prop) => {
+                self.pass_access_property(base, dot.clone(), prop)
+                    .map(|v| (v.0, v.1))
+            },
             Expr::Binary(binary) => {
                 if matches!(state, ExprState::IsStmt) {
                     self.add_error(CheckerError::InvalidExpressionAsStatement(
@@ -708,6 +743,17 @@ impl Checker {
                     None
                 } else {
                     self.pass_assignment(assignment)
+                }
+            }
+            Expr::Switch(switch) => {
+                if !matches!(state, ExprState::IsStmt) {
+                    self.add_error(CheckerError::InvalidExpressionAsValue(
+                        expr.loc(),
+                        "switch statement",
+                    ));
+                    None
+                } else {
+                    return self.pass_switch(switch)
                 }
             }
             Expr::SlotDecl { mutability, name, ty } => {
@@ -763,6 +809,18 @@ impl Checker {
                     return self.pass_while_loop(while_kw, condition, block);
                 }
             }
+            Expr::Defer(defer_kw, subexpr) => {
+                if !matches!(state, ExprState::IsStmt) {
+                    self.add_error(CheckerError::InvalidExpressionAsValue(
+                        defer_kw.clone(),
+                        "defer statement",
+                    ));
+                    None
+                } else {
+                    let (_, subexpr_hir) = self.pass_reachable_expr(&subexpr, ExprState::IsExpr, None)?;
+                    Some((Type::Void, HIRExpr::new_defer(Box::new(subexpr_hir))))
+                }
+            }
         };
         let prim_target = prim?;
         Some((prim_target.0, Reachability::Reachable, prim_target.1))
@@ -779,7 +837,7 @@ impl Checker {
         let cond = self.pass_condition(condition)?;
 
         // check block
-        let (reachability, hirblock) = self.pass_block(block)?;
+        let (reachability, hirblock) = self.pass_block(block, true)?;
 
         self.check_for_loop_loopability(while_kw, reachability.clone());
 
@@ -813,8 +871,9 @@ impl Checker {
         let cond = self.pass_condition(condition)?;
         if let Some(else_part) = else_part {
             // then code after this MIGHT be unreachable
-            let (reachability_of_if, hir_if_block) = self.pass_block(then)?;
-            let (reachability_of_else, hir_else_block) = self.pass_block(&else_part.1)?;
+
+            let (reachability_of_if, hir_if_block) = self.pass_block(then, false)?;
+            let (reachability_of_else, hir_else_block) = self.pass_block(&else_part.1, false)?;
             let reachability_of_conditional = reachability_of_if & reachability_of_else;
 
             Some((
@@ -829,7 +888,7 @@ impl Checker {
             ))
         } else {
             // code after this is surely reachable
-            let (_, hir_if_block) = self.pass_block(then)?;
+            let (_, hir_if_block) = self.pass_block(then, true)?;
 
             Some((
                 Type::new_void(),
@@ -847,7 +906,7 @@ impl Checker {
     /// Validates a condition.
     fn pass_condition(&mut self, condition: &Expr) -> Option<HIRExpr> {
         let (conditional_ty, hir_conditional) =
-            self.pass_reachable_expr(condition, ExprState::IsExpr)?;
+            self.pass_reachable_expr(condition, ExprState::IsExpr, None)?;
 
         if !matches!(
             conditional_ty,
@@ -875,7 +934,7 @@ impl Checker {
             Expr::Variable(variable_name) => {
                 // return a pointer to the specified type
                 let set_init = matches!(state, ExprState::IsAssignmentLhs);
-                let (var_ty, var_expr, var_mut, var_was_init) = self.get_var(
+                let (var_ty, var_expr, var_mut, var_was_init, scope_index) = self.get_var(
                     variable_name.loc(),
                     &variable_name.index(),
                     set_init,
@@ -885,14 +944,14 @@ impl Checker {
                     if !var_was_init {
                         // return mutable pointer if variable is not
                         // initialized
-                        return Some((Type::new_pointer(Box::new(var_ty), Some(Loc::default())), var_expr))
+                        return Some((Type::new_pointer(Box::new(var_ty), Some(Loc::default()), Some(scope_index)), var_expr))
                     }
                 }
-                Some((Type::new_pointer(Box::new(var_ty), var_mut), var_expr))
+                Some((Type::new_pointer(Box::new(var_ty), var_mut, Some(scope_index)), var_expr))
             }
             Expr::AccessProperty(base, dot, ident) => {
-                let (ty, expr) = self.pass_access_property(base, dot.clone(), ident)?;
-                Some((Type::new_pointer(Box::new(ty), Some(Loc::default())), expr))
+                let (ty, expr, lifetime) = self.pass_access_property(base, dot.clone(), ident)?;
+                Some((Type::new_pointer(Box::new(ty), Some(Loc::default()), lifetime), expr))
             }
             _ => {
                 // Taking address of non-lvalue reference
@@ -902,24 +961,142 @@ impl Checker {
         }
     }
 
+    /// Validates a let expression.
+    fn pass_let_expr(
+        &mut self,
+        mutable: bool,
+        loc_or_let: &Loc,
+        name: &Identifier,
+        ty: Option<&(Loc, Type)>,
+        eq: &Loc,
+        expr: &Expr,
+    ) -> Option<(Type, HIRExpr)> {
+        let (value_ty, value_hir) = self.pass_reachable_expr(
+            expr,
+            ExprState::IsExpr,
+            None,
+        )?;
+        let actual_ty = ty.map(|t| &t.1).unwrap_or(&value_ty);
+        let binding = Some(loc_or_let.clone());
+        self.pass_slot_decl(
+            name,
+            actual_ty,
+            if mutable {
+                &binding
+            } else {
+                &None
+            },
+        )?;
+        self.pass_assignment(
+            &AssignmentExpr(BinaryExpr {
+                left_hand_side: Box::new(
+                    Expr::AsReference(
+                        AsReferenceExpr(
+                            name.0.clone(),
+                            Box::new(
+                                Expr::Variable(name.clone()),
+                            )
+                        )
+                    )
+                ),
+                op: (eq.clone(), BinaryOp::Plus),
+                right_hand_side: Either::Left(Box::new(expr.clone())),
+            })
+        )
+    }
+
     /// Validates a literal expression.
-    fn pass_lit_expr(&mut self, expr: &LiteralExpr) -> Option<(Type, HIRExpr)> {
+    fn pass_lit_expr(&mut self, expr: &LiteralExpr, expected_type: Option<Type>) -> Option<(Type, HIRExpr)> {
         match expr {
-            LiteralExpr::Int(i) => {
+            LiteralExpr::Int(ty, i) => {
                 // return an int type
-                Some((
-                    Type::new_primitive(i.0.clone(), PrimType::new_int(TypeBits::B64)),
-                    HIRExpr::Literal(expr.clone()),
-                ))
+                if let Some(Type::Primitive { loc, ty: PrimType::Int(bits) }) = expected_type {
+                    let max_value = match bits {
+                        TypeBits::B64 => i64::MAX as u64,
+                        TypeBits::B32 => i32::MAX as u64,
+                        TypeBits::B16 => i16::MAX as u64,
+                        TypeBits::B8 => i8::MAX as u64,
+                    };
+
+                    if i.2 > max_value {
+                        self.add_error(
+                            CheckerError::LitTooBigForTy(
+                                i.clone(),
+                                Type::Primitive { loc, ty: PrimType::Int(bits) },
+                                max_value
+                            )
+                        );
+                        None
+                    } else {
+                        Some((
+                            Type::Primitive { loc, ty: PrimType::Int(bits) },
+                            HIRExpr::Literal(
+                                HIRLiteralExpr::Int(
+                                    self.pass_ty(Type::Primitive { loc, ty: PrimType::Int(bits) })?,
+                                    i.clone(),
+                                )
+                            )
+                        ))
+                    }
+                } else if let Some(Type::Primitive { loc, ty: PrimType::UInt(bits) }) = expected_type {
+                    if i.1 {
+                        // unsigned integer does not support negative numbers
+                        self.add_error(
+                            CheckerError::IntTyNonNeg(
+                                i.clone(),
+                                Type::Primitive { loc, ty: PrimType::UInt(bits) },
+                            )
+                        );
+                        None
+                    } else {
+                        let max_value = match bits {
+                            TypeBits::B64 => u64::MAX,
+                            TypeBits::B32 => u32::MAX as u64,
+                            TypeBits::B16 => u16::MAX as u64,
+                            TypeBits::B8 => u8::MAX as u64,
+                        };
+
+                        if i.2 > max_value {
+                            self.add_error(
+                                CheckerError::LitTooBigForTy(
+                                    i.clone(),
+                                    Type::Primitive { loc, ty: PrimType::UInt(bits) },
+                                    max_value
+                                )
+                            );
+                            None
+                        } else {
+                            Some((
+                                Type::Primitive { loc, ty: PrimType::UInt(bits) },
+                                HIRExpr::Literal(
+                                    HIRLiteralExpr::Int(
+                                        self.pass_ty(Type::Primitive { loc, ty: PrimType::Int(bits) })?,
+                                        i.clone(),
+                                    )
+                                )
+                            ))
+                        }
+                    }
+                } else {
+                    Some((
+                        Type::new_primitive(i.0.clone(), PrimType::new_int(TypeBits::B64)),
+                        HIRExpr::Literal(
+                            HIRLiteralExpr::Int(
+                                self.pass_ty(Type::Primitive { loc: i.0.clone(), ty: PrimType::Int(TypeBits::B32) })?,
+                                i.clone(),
+                            )
+                        )
+                    ))
+                }
             }
         }
     }
 
     /// Validastes the dereferencing of a pointer.
     fn pass_dereference_expr(&mut self, deref: &Loc, base: &Expr) -> Option<(Type, HIRExpr)> {
-        let (base_ty, base_hir) = self.pass_reachable_expr(base, ExprState::IsExpr)?;
+        let (base_ty, base_hir) = self.pass_reachable_expr(base, ExprState::IsExpr, None)?;
 
-        if let Type::Pointer { pointee, mutability: _ } = &base_ty {
+        if let Type::Pointer { pointee, mutability: _, lifetime: _ } = &base_ty {
             let hir_pointee = self.pass_ty(*pointee.clone())?;
             Some(((**pointee).clone(), HIRExpr::Dereference(hir_pointee, Box::new(base_hir))))
         } else {
@@ -939,7 +1116,7 @@ impl Checker {
     ) -> Option<(Type, HIRExpr)> {
         if let Some(Member::Type(ty)) = self.ctx.lookup_member(&struct_name.index()) {
             match &ty.borrow().ty {
-                UserType::Struct { fields } => {
+                UserType::Struct(Struct { fields }) => {
                     let struct_ty = self.pass_ty(Type::NamedType(struct_name.clone()))?;
 
                     if expr_fields.len() != fields.len() {
@@ -954,7 +1131,7 @@ impl Checker {
                         // check for each field
                         let mut hir_fields = Vec::new();
 
-                        for (index, field) in fields.iter().enumerate() {
+                        for (_, field) in fields.iter().enumerate() {
                             if let Some((spec_name, field_expr)) = expr_fields.iter().find(|(name, _)| name == &field.0) {
                                 // number of expressions for field
                                 let provided_exprs_for_field = expr_fields.iter().filter(|value| &value.0 == spec_name).count();
@@ -970,18 +1147,19 @@ impl Checker {
                                 }
                                 
                                 // pass field expr
-                                let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(field_expr, ExprState::IsExpr)?;
+                                let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(field_expr, ExprState::IsExpr, None)?;
 
                                 if !self.types_are_same(spec_name.loc(), &spec_field_ty, &field.1)? {
                                     self.add_error(CheckerError::WrongTyForField {
                                         struct_name: struct_name.clone(),
                                         field_name: field.0.clone(),
-                                        supplied_ty: spec_field_ty,
+                                        supplied_ty: spec_field_ty.clone(),
                                         expected_ty: field.1.clone(),
+                                        instantiating: "struct",
                                     })
                                 }
                                 
-                                hir_fields.push(spec_field_hir);
+                                hir_fields.push((spec_field_hir, self.type_is_aggregate(spec_field_ty)));
                             } else {
                                 self.add_error(CheckerError::FieldNotProvidedWhenInstantiating {
                                     struct_name: struct_name.clone(),
@@ -1002,6 +1180,53 @@ impl Checker {
                                 hir_fields,
                             )
                         ))
+                    }
+                }
+                UserType::Union(fields) => {
+                    let union_ty = self.pass_ty(Type::NamedType(struct_name.clone()))?;
+
+                    if expr_fields.len() != 1 {
+                        // can only specify one field at a time for an union
+                        self.add_error(
+                            CheckerError::UnionMultipleFieldInstantiation(struct_name.0.clone())
+                        );
+                        None
+                    } else {
+                        let (spec_field_name, spec_field_expr) = expr_fields.first().cloned().unwrap();
+                        let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(&spec_field_expr, ExprState::IsExpr, None)?;
+                        
+                        for (field_name, field_ty) in fields.iter() {
+                            if field_name == &spec_field_name {
+                                if !self.types_are_same(spec_field_name.loc(), &field_ty, &spec_field_ty)? {
+                                    self.add_error(CheckerError::WrongTyForField {
+                                        struct_name: struct_name.clone(),
+                                        field_name: field_name.clone(),
+                                        supplied_ty: spec_field_ty,
+                                        expected_ty: field_ty.clone(),
+                                        instantiating: "union",
+                                    });
+                                    return None
+                                } else {
+                                    return Some((
+                                        Type::NamedType(struct_name.clone()),
+                                        HIRExpr::new_instantiate_union(
+                                            union_ty,
+                                            Box::new(spec_field_hir),
+                                            self.type_is_aggregate(spec_field_ty),
+                                        )
+                                    ))
+                                }
+                            }
+                        }
+
+                        // no such field
+                        self.add_error(
+                            CheckerError::InvalidUnionField {
+                                uni: struct_name.clone(),
+                                field: spec_field_name,
+                            }
+                        );
+                        None
                     }
                 }
                 _ => {
@@ -1031,8 +1256,11 @@ impl Checker {
             right_hand_side,
         }: &BinaryExpr,
     ) -> Option<(Type, HIRExpr)> {
-        let (lhs_ty, lhs_hir) = self.pass_reachable_expr(&left_hand_side, ExprState::IsExpr)?;
-        let (rhs_ty, rhs_hir) = self.pass_reachable_expr(&right_hand_side, ExprState::IsExpr)?;
+        let (lhs_ty, lhs_hir) = self.pass_reachable_expr(&left_hand_side, ExprState::IsExpr, None)?;
+        let (rhs_ty, rhs_hir) = match right_hand_side {
+            Either::Left(rhs) => self.pass_reachable_expr(&rhs, ExprState::IsExpr, None)?,
+            Either::Right((rhs_ty, rhs_hir)) => (rhs_ty.clone(), rhs_hir.clone()),
+        };
 
         if !self.types_are_same(&left_hand_side.loc(), &lhs_ty, &rhs_ty)? {
             // cannot use binary operator in different types
@@ -1063,22 +1291,30 @@ impl Checker {
         base: &Expr,
         dot: Loc,
         prop: &Identifier,
-    ) -> Option<(Type, HIRExpr)> {
-        let (base_ty, base_val) = self.pass_reachable_expr(base, ExprState::IsExpr)?;
+    ) -> Option<(Type, HIRExpr, Option<usize>)> {
+        let (base_ty, base_val) = self.pass_reachable_expr(base, ExprState::IsExpr, None)?;
 
         let hir_ty = self.pass_ty(base_ty.clone())?;
+        let mut life_time = None;
+
+        if let Expr::Variable(v) = base {
+            let (_, _, _, _, lifetime) = self.get_var(&base.loc(), &v.1, false, false)?;
+            life_time = Some(lifetime);
+        }
+
         // check if we are accessing Struct or *Struct
         let (name, requires_dereferencing, hir_ty) = match &base_ty {
-            Type::Pointer { pointee, mutability: _ } => {
+            Type::Pointer { pointee, mutability: _, lifetime } => {
+                life_time = *lifetime;
                 if let Type::NamedType(name) = &**pointee {
-                    (name, true, if let HIRType::Pointer { pointee, mutability } = hir_ty {
+                    (name, true, if let HIRType::Pointer { pointee, .. } = hir_ty {
                         *pointee
                     } else {
                         unreachable!()
                     })
                 } else {
                     self.add_error(
-                        CheckerError::AccPropOfNonStructTy(dot, base_ty)
+                        CheckerError::AccPropOfNonAggrTy(dot, base_ty)
                     );
                     return None
                 }
@@ -1086,16 +1322,16 @@ impl Checker {
             Type::NamedType(name) => (name, false, hir_ty),
             _ => {
                 self.add_error(
-                    CheckerError::AccPropOfNonStructTy(dot, base_ty)
+                    CheckerError::AccPropOfNonAggrTy(dot, base_ty)
                 );
                 return None
             }
         };
         if let Some(Member::Type(actt)) = self.ctx.lookup_member(&name.index()) {
-            if let CtxUserType { ty: UserType::Struct { fields }, .. } = &*actt.borrow() {
+            if let CtxUserType { ty: UserType::Struct(Struct { fields }), .. } = &*actt.borrow() {
 
                 if let Some((field_index, (_, field_type))) = fields.iter().enumerate().find(|element| element.1.0.index() == prop.index()) {
-                    let expr = HIRExpr::new_access_property(
+                    let expr = HIRExpr::new_access_struct_property(
                         Box::new(base_val),
                         hir_ty,
                         field_index as u32,
@@ -1103,7 +1339,7 @@ impl Checker {
                         requires_dereferencing,
                     );
                     
-                    Some((field_type.clone(), expr))
+                    Some((field_type.clone(), expr, life_time))
                 } else {
                     self.add_error(
                         CheckerError::NoSuchPropAtStruct(base_ty, prop.clone())
@@ -1113,13 +1349,13 @@ impl Checker {
                 
             } else {
                 self.add_error(
-                    CheckerError::AccPropOfNonStructTy(dot, base_ty)
+                    CheckerError::AccPropOfNonAggrTy(dot, base_ty)
                 );
                 None
             }
         } else {
             self.add_error(
-                CheckerError::AccPropOfNonStructTy(dot, base_ty)
+                CheckerError::AccPropOfNonAggrTy(dot, base_ty)
             );
             None
         }
@@ -1161,6 +1397,18 @@ impl Checker {
 
             None
         } else {
+            if let Some((_, _function_found, hir_prototype, prototype)) = func.instantiated.iter().find(|generic| generic.0.as_slice() == templates) {
+                // return if we already instantiated with these template
+                // arguments
+                return Some((
+                    Type::new_function_pointer(prototype.clone()),
+                    HIRExpr::GlobalFunc(
+                        hir_prototype.name.clone(),
+                        hir_prototype.clone(),
+                    )
+                ))
+            }
+
             // define this function
             let namespace_of_definition = func.parent
                 .upgrade()
@@ -1214,7 +1462,7 @@ impl Checker {
         CallExpr { callee, params }: &CallExpr,
     ) -> Option<(Type, HIRExpr)> {
         // get type of callee
-        let (callee_type, callee_hir) = self.pass_reachable_expr(&callee, ExprState::IsExpr)?;
+        let (callee_type, callee_hir) = self.pass_reachable_expr(&callee, ExprState::IsExpr, None)?;
 
         if let Type::FunctionPointer(ref prototype) = callee_type {
             // validate parameters
@@ -1236,13 +1484,11 @@ impl Checker {
                 // check types of each statement
 
                 // if there are generics
-                if let Some(generics) = prototype.generics() {
-                    // there ARE generics
-                } else {
+                if prototype.generics().is_none() {
                     // there aren't any generics
                     for (arg, param) in prototype.arguments().iter().zip(params.iter()) {
                         let (param_ty, param_expr) =
-                            self.pass_reachable_expr(param, ExprState::IsExpr)?;
+                            self.pass_reachable_expr(param, ExprState::IsExpr, None)?;
     
                         if !self.types_are_same(&param.loc(), &param_ty, &arg.ty)? {
                             self.add_error(CheckerError::WrongParamTy {
@@ -1264,6 +1510,7 @@ impl Checker {
                 HIRExpr::Call(HIRCallExpr {
                     callee: Box::new(callee_hir),
                     params: hir_params,
+                    returns_aggregate: self.type_is_aggregate((**prototype.return_type()).clone()),
                 }),
             ))
         } else {
@@ -1284,17 +1531,32 @@ impl Checker {
         }): &AssignmentExpr,
     ) -> Option<(Type, HIRExpr)> {
         let (variable, variable_hir_expr) =
-            self.pass_reachable_expr(&left_hand_side, ExprState::IsAssignmentLhs)?;
+            self.pass_reachable_expr(&left_hand_side, ExprState::IsAssignmentLhs, None)?;
 
-        if let Type::Pointer { pointee, mutability: Some(_) } = variable {
+        if let Type::Pointer { pointee, mutability: Some(mutability), lifetime } = variable {
             let (type_of_expression, expression_hir) =
-                self.pass_reachable_expr(&right_hand_side, ExprState::IsExpr)?;
+                self.pass_reachable_expr((right_hand_side.as_ref()).unwrap_left(), ExprState::IsExpr, Some((*pointee).clone()))?;
+
+            // if we're assigning a pointer and we know its lifetime
+            if let Type::Pointer { pointee: val_pointee, mutability: val_mut, lifetime: Some(lifetime_of_pointer) } = type_of_expression.clone() {
+                // if the lifetime of the variable is greater than the
+                // lifetime of the pointer
+                if lifetime.unwrap() > lifetime_of_pointer {
+                    self.add_error(
+                        CheckerError::LifetimeOfVariableGreaterThanOfPointer(
+                            (right_hand_side.as_ref()).unwrap_left().loc(),
+                            Type::Pointer { pointee: pointee.clone(), mutability: Some(mutability), lifetime },
+                            Type::Pointer { pointee: val_pointee, mutability: val_mut, lifetime: Some(lifetime_of_pointer) }
+                        )
+                    );
+                }
+            }
 
             if !self.types_are_same(&op.0, &pointee, &type_of_expression)? {
                 // assigning wrong type
                 self.add_error(CheckerError::AssignWrongTy {
                     slot_ty: *pointee,
-                    expr_loc: right_hand_side.loc(),
+                    expr_loc: (right_hand_side.as_ref()).unwrap_left().loc(),
                     expr_ty: type_of_expression,
                 });
 
@@ -1307,22 +1569,10 @@ impl Checker {
                         op: op.clone(),
                         right_hand_side: Box::new(expression_hir),
                         op_ty: BinOpType::Int,
-                    }, if let Type::NamedType(t) = &type_of_expression {
-                        if let Some(Member::Type(actt)) = self.ctx.lookup_member(&t.index()) {
-                            if let CtxUserType { ty: UserType::Struct { .. }, .. } = &*actt.borrow() {
-                                Some(self.pass_ty(type_of_expression)?)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    })),
+                    }, self.type_is_aggregate(*pointee))),
                 ))
             }
-        } else if let Type::Pointer { pointee: _, mutability: None } = &variable {
+        } else if let Type::Pointer { pointee: _, mutability: None, lifetime: _ } = &variable {
             self.add_error(CheckerError::ChangeConst {
                 lvalue_ty: variable,
                 loc: left_hand_side.loc(),
@@ -1334,6 +1584,552 @@ impl Checker {
             unreachable!(
                 "error in parser: left hand side of assignment is not an lvalue: is {variable:?}"
             )
+        }
+    }
+
+    /// Typechecks a switch statement.
+    fn pass_switch(&mut self, switch: &Switch) -> Option<(Type, Reachability, HIRExpr)> {
+        // pass the expression
+        let (type_of_value_switched_on, value_switched_on_hir) = self.pass_reachable_expr(switch.value(), ExprState::IsExpr, None)?;
+
+        let mut pattern_is_currently_unreachable = false;
+        let mut statement_reachability = Reachability::Unreachable;
+        let mut hir_cases = vec![];
+
+        for case in switch.patterns() {
+            if pattern_is_currently_unreachable {
+                self.add_error(
+                    CheckerError::UnreachableCasePattern(
+                        case.case().clone(),
+                    )
+                );
+                break;
+            }
+
+            let result = self.pass_case(case, &type_of_value_switched_on)?;
+            statement_reachability &= result.block_is_reachable;
+            if !result.pattern_is_reachable {
+                pattern_is_currently_unreachable = true;
+            }
+            hir_cases.push(result.case);
+        }
+
+        Some((
+            Type::Void,
+            statement_reachability,
+            HIRExpr::new_switch(
+                HIRSwitch::new(
+                    Box::new(value_switched_on_hir),
+                    hir_cases,
+                )
+            )
+        ))
+    }
+
+    /// Typechecks a case statement.
+    /// 
+    /// Returns the HIR expression of the case statement and
+    /// if it is reachable or not.
+    fn pass_case(&mut self, case: &Case, value_ty: &Type) -> Option<CaseResult> {
+        // get attributes from the case
+        let pattern = case.pattern();
+        let block = case.block();
+
+        // pass through the pattern
+        let (
+            pattern_hir,
+            is_reachable,
+            names
+        ) = self.pass_pattern(case.case(), pattern, value_ty)?;
+        
+        // set up the case block's scope
+        self.ctx.add_normal_scope(false);
+        // set up the bindings' names
+        for (binding_name, binding_ty, binding_mutability) in names.into_iter() {
+            self.ctx.insert_variable_in_last_scope(
+                binding_name.index(),
+                binding_ty,
+                None,
+                binding_mutability,
+                true
+            );
+        }
+
+        let (reachability, hir_block) = self.pass_block(block, false)?;
+
+        // pop scope
+        self.ctx.pop_scope();
+
+        Some(CaseResult {
+            case: HIRCase::new(pattern_hir, hir_block),
+            pattern_is_reachable: is_reachable,
+            block_is_reachable: reachability,
+        })
+    }
+
+    /// Typechecks a single pattern.
+    ///
+    /// Returns the HIR expression of the pattern and if it is
+    /// reachable or not.
+    /// 
+    /// Also returns the matched identifiers and their types.
+    fn pass_pattern(&mut self, loc: &Loc, pattern: &Pattern, value_ty: &Type) -> Option<(HIRPattern, bool, Vec<(Identifier, Type, Mutability)>)> {
+        use Pattern as P;
+
+        match pattern {
+            P::Literal(lit) => {
+                // check if the literal used is valid
+                let (literal_ty, literal_hir) = self.pass_reachable_expr(
+                    &Expr::Literal(lit.clone()),
+                    ExprState::IsExpr,
+                    Some(value_ty.clone()),
+                )?;
+                if !self.types_are_same(
+                    loc,
+                    value_ty,
+                    &literal_ty
+                )? {
+                    self.add_error(
+                        CheckerError::InvalidPatForTy {
+                            loc: loc.clone(),
+                            switched_on: value_ty.clone(),
+                            pattern_ty: literal_ty,
+                        }
+                    );
+                    return None;
+                }
+
+                // literal patterns are always reachable
+                Some((
+                    HIRPattern::new_literal(self.pass_ty(literal_ty)?, if let HIRExpr::Literal(l) = literal_hir {
+                        l
+                    } else {
+                        unreachable!()
+                    }),
+                    true,
+                    vec![],
+                ))
+            }
+            P::ExclusiveRange { begin, range_tok, end } => {
+                self.pass_range(
+                    loc,
+                    begin,
+                    range_tok,
+                    end,
+                    value_ty,
+                    |this, left, right, range, value_type| {
+                        // range exclusive for ints
+                        let equivalent_left: i128 = left.clone().into();
+                        let equivalent_right: i128 = right.clone().into();
+                        // check if the range is invalid
+                        if equivalent_right > equivalent_left {
+                            this.add_error(
+                                CheckerError::LeftGreaterThanRightInRange(
+                                    range.clone(),
+                                )
+                            );
+                        } else if equivalent_left == equivalent_right {
+                            this.add_error(
+                                CheckerError::RangeExclusiveWithEqualEnds(
+                                    range.clone(),
+                                )
+                            );
+                        }
+                        
+                        // exclusive range patterns are always reachable
+                        Some((
+                            HIRPattern::new_range(
+                                this.pass_ty(value_type.clone())?,
+                                HIRLiteralExpr::Int(
+                                    this.pass_ty(value_type.clone())?,
+                                    left.clone(),
+                                ),
+                                HIRLiteralExpr::Int(
+                                    this.pass_ty(value_type.clone())?,
+                                    IntLit(right.0.clone(), right.1, right.2 - 1),
+                                )
+                            ),
+                            true,
+                            vec![],
+                        ))
+                    }
+                )
+            }
+            P::InclusiveRange { begin, range_tok, end } => {
+                self.pass_range(
+                    loc,
+                    begin,
+                    range_tok,
+                    end,
+                    value_ty,
+                    |this, left, right, range, value_type| {
+                        // range exclusive for ints
+                        let equivalent_left: i128 = left.clone().into();
+                        let equivalent_right: i128 = right.clone().into();
+                        // check if the range is invalid
+                        if equivalent_right > equivalent_left {
+                            this.add_error(
+                                CheckerError::LeftGreaterThanRightInRange(
+                                    range.clone(),
+                                )
+                            );
+                        }
+                        // here we removed the check for equality because range inclusive
+                        // allows for left == right
+                        
+                        // exclusive range patterns are always reachable
+                        Some((
+                            HIRPattern::new_range(
+                                this.pass_ty(value_type.clone())?,
+                                HIRLiteralExpr::Int(
+                                    this.pass_ty(value_type.clone())?,
+                                    left.clone(),
+                                ),
+                                HIRLiteralExpr::Int(
+                                    this.pass_ty(value_type.clone())?,
+                                    right.clone(),
+                                )
+                            ),
+                            true,
+                            vec![],
+                        ))
+                    }
+                )
+            }
+            P::DeStructure { name, lkey_tok, fields, ignore, rkey_tok } => {
+                self.pass_destructure(name, lkey_tok, fields.as_slice(), ignore.as_ref(), rkey_tok)
+            }
+            // TODO: Typecheck the rest of the patterns
+            _ => todo!()
+        }
+    }
+
+    /// Passes through a range.
+    /// 
+    /// Takes in the `case` token and the `..` (range)
+    /// token for debugging information, the value of
+    /// the type being matched on, the begin and end
+    /// values of the range and handlers for all of
+    /// the values.
+    fn pass_range(
+        &mut self,
+        case_tok: &Loc,
+        begin: &LiteralExpr,
+        range_tok: &Loc,
+        end: &LiteralExpr,
+        value_ty: &Type,
+        int_handler: fn(this: &mut Self, &IntLit, &IntLit, &Loc, &Type) -> Option<(HIRPattern, bool, Vec<(Identifier, Type, Mutability)>)>,
+    ) -> Option<(HIRPattern, bool, Vec<(Identifier, Type, Mutability)>)> {
+        // check if range has same types
+        let (begin_ty, _begin_hir) = self.pass_reachable_expr(
+            &Expr::Literal(begin.clone()),
+            ExprState::IsExpr,
+            Some(value_ty.clone()),
+        )?;
+        let (end_ty, _end_hir) = self.pass_reachable_expr(
+            &Expr::Literal(end.clone()),
+            ExprState::IsExpr,
+            Some(value_ty.clone()),
+        )?;
+        if !self.types_are_same(
+            case_tok,
+            &begin_ty,
+            &end_ty,
+        )? {
+            self.add_error(
+                CheckerError::RangeEndsTyDiff {
+                    begin_ty: begin_ty.clone(),
+                    range: range_tok.clone(),
+                    end_ty,
+                }
+            );
+        }
+        // check if types support ranging
+        if let (LiteralExpr::Int(_, i1), LiteralExpr::Int(_, i2)) = (begin, end) {
+            int_handler(self, i1, i2, range_tok, value_ty)
+        } else {
+            self.add_error(
+                CheckerError::LitDoesntSupportRange(range_tok.clone(), begin_ty)
+            );
+            None
+        }
+    }
+
+    /// Typechecks the destructuring of a struct.
+    fn pass_destructure(
+        &mut self,
+        name: &Identifier,
+        lkey_tok: &Loc,
+        fields: &[(Mutability, Identifier, Option<Pattern>)],
+        ignore: Option<&Loc>,
+        rkey_tok: &Loc,
+    ) -> Option<(HIRPattern, bool, Vec<(Identifier, Type, Mutability)>)> {
+        let mut names = vec![];
+        let (pattern, reachable) = self.pass_destructure_impl(
+            name,
+            lkey_tok,
+            fields,
+            ignore,
+            rkey_tok,
+            &mut names,
+        )?;
+        Some((pattern, reachable, names))
+    }
+    
+    /// Typechecks the destructuring of a struct.
+    fn pass_destructure_impl(
+        &mut self,
+        name: &Identifier,
+        lkey_tok: &Loc,
+        fields: &[(Mutability, Identifier, Option<Pattern>)],
+        ignore: Option<&Loc>,
+        rkey_tok: &Loc,
+        names: &mut Vec<(Identifier, Type, Mutability)>,
+    ) -> Option<(HIRPattern, bool)> {
+        use Pattern as P;
+
+        // get the aggregate type
+        if let Some(Member::Type(aggr_ty)) = self.ctx.lookup_member(&name.index()) {
+            // if it's an union, we can only match one field at a time
+            // if it's a struct, then we don't need so
+            let binding = aggr_ty.borrow();
+            let CtxUserType { ty, parent: _ } = &*binding;
+            match ty {
+                UserType::Struct(struct_ty) => {
+                    self.handle_struct_destructure(name, struct_ty, fields, ignore, names)
+                }
+                UserType::Union(union_ty) => {
+                    // error if nothing is provided
+                    if fields.len() == 0 && ignore.is_none() {
+                        self.add_error(
+                            CheckerError::NoFieldsSpecifiedToUnionPattern {
+                                name: name.clone(),
+                            },
+                        );
+                    }
+                    // error if anything more than one is provided
+                    else if fields.len() != 1 {
+                        self.add_error(
+                            CheckerError::TooManyFieldsSpecifiedForUnionPattern {
+                                name: name.clone(),
+                                amount: fields.len(),
+                            },
+                        );
+                    }
+
+                    self.handle_union_destructure(name, &union_ty, fields.first().unwrap(), names)
+                }
+                UserType::Alias(_) => {
+                    self.add_error(
+                        CheckerError::MatchingOnAlias(name.clone()),
+                    );
+                    None
+                }
+            }
+        } else {
+            self.add_error(
+                CheckerError::NamedTypeNotFound(name.clone()),
+            );
+            None
+        }
+    }
+
+    /// Handles the destructuring of structs.
+    fn handle_struct_destructure(
+        &mut self,
+        name: &Identifier,
+        struct_ty: &Struct,
+        fields: &[(Mutability, Identifier, Option<Pattern>)],
+        ignore: Option<&Loc>,
+        names: &mut Vec<(Identifier, Type, Mutability)>,
+    ) -> Option<(HIRPattern, bool)> {
+        // error if too much fields are specified
+        if fields.len() > struct_ty.fields.len() {
+            self.add_error(
+                CheckerError::TooManyStructFieldsMatchedInPat {
+                    name: name.clone(),
+                    expected: struct_ty.fields.len(),
+                    found: fields.len()
+                }
+            );
+        }
+        // error if all fields are not handled
+        else if fields.len() != struct_ty.fields.len() && ignore.is_none() {
+            self.add_error(
+                CheckerError::StructFieldsNotMatchedInPat {
+                    name: name.clone(),
+                    expected: struct_ty.fields.len(),
+                    found: fields.len()
+                }
+            );
+        }
+        // check for the fields if this is always reachable or not
+        let mut is_reachable = false;
+        // the new constructed fields
+        let mut new_fields: Vec<(String, usize, HIRPattern, HIRType)> = Vec::new();
+        // go through fields
+        for (field_mutability, field_name, pattern) in fields.iter() {
+            // check if field doesn't exist
+            if let Some((index, (_, field_ty))) = struct_ty.fields.iter().enumerate().find(|field| &field.1.0 == field_name) {
+                // handle pattern for field
+                let (field_hir, _) = self.handle_aggregate_field_pattern(
+                    pattern.as_ref(),
+                    field_mutability,
+                    field_name,
+                    &mut is_reachable,
+                    field_ty,
+                    names
+                )?;
+                // add to hir fields
+                new_fields.push((
+                    self.name(field_name),
+                    index,
+                    field_hir,
+                    self.pass_ty(field_ty.clone())?,
+                ));
+            } else {
+                // property doesn't exist at struct
+                self.add_error(
+                    CheckerError::NoSuchPropAtStruct(
+                        Type::new_named_type(name.clone()),
+                        field_name.clone(),
+                    )
+                );
+            }
+        }
+
+        
+        Some((
+            HIRPattern::new_de_structure(
+                self.pass_ty(Type::new_named_type(name.clone()))?,
+                false,
+                new_fields,
+            ),
+            is_reachable
+        ))
+    }
+
+    /// Handles typechecking of a single pattern
+    /// of a field of an aggregate type
+    fn handle_aggregate_field_pattern(
+        &mut self,
+        pattern: Option<&Pattern>,
+        field_mutability: &Mutability,
+        field_name: &Identifier,
+        is_reachable: &mut bool,
+        field_ty: &Type,
+        names: &mut Vec<(Identifier, Type, Mutability)>,
+    ) -> Option<(HIRPattern, bool)> {
+        use Pattern as P;
+
+        match pattern {
+            Some(P::WildCard(mutability, name)) => {
+                // add name to names
+                names.push((
+                    name.clone(),
+                    field_ty.clone(),
+                    mutability.clone(),
+                ));
+
+                let is_aggr = self.type_is_aggregate(field_ty.clone());
+
+                if let Some(aggr) = is_aggr {
+                    Some((HIRPattern::new_wild_card(aggr, true, self.name(name)), false))
+                } else {
+                    Some((HIRPattern::new_wild_card(self.pass_ty(field_ty.clone())?, false, self.name(name)), false))
+                }
+            }
+            Some(P::DeStructure { name, lkey_tok, fields, ignore, rkey_tok }) => {
+                // put the names of the destructuring in the already known names
+                self.pass_destructure_impl(
+                    name,
+                    lkey_tok,
+                    fields.as_slice(),
+                    ignore.as_ref(),
+                    rkey_tok,
+                    names,
+                )
+            }
+            Some(other) => {
+                // pass the pattern
+                let (
+                    other_hir,
+                    other_is_reachable,
+                    new_names
+                ) = self.pass_pattern(
+                    field_name.loc(),
+                    other,
+                    field_ty,
+                )?;
+                if other_is_reachable {
+                    *is_reachable = true;
+                }
+                names.extend(new_names.into_iter());
+                Some((
+                    other_hir,
+                    other_is_reachable
+                ))
+            }
+            None => {
+                // add name to names
+                names.push((
+                    field_name.clone(),
+                    field_ty.clone(),
+                    field_mutability.clone(),
+                ));
+
+                let is_aggr = self.type_is_aggregate(field_ty.clone());
+
+                if let Some(aggr) = is_aggr {
+                    Some((HIRPattern::new_wild_card(aggr, true, self.name(field_name)), false))
+                } else {
+                    Some((HIRPattern::new_wild_card(self.pass_ty(field_ty.clone())?, false, self.name(field_name)), false))
+                }
+            }
+        }
+    }
+
+    /// Handles the destructuring of unions.
+    fn handle_union_destructure(
+        &mut self,
+        name: &Identifier,
+        fields: &[(Identifier, Type)],
+        field: &(Mutability, Identifier, Option<Pattern>),
+        names: &mut Vec<(Identifier, Type, Mutability)>,
+    ) -> Option<(HIRPattern, bool)> {
+        // this is much simpler than the struct one because
+        // we only have to account for a single field instead
+        // of many fields
+
+        let mut is_reachable = false;
+
+        // check if field exists
+        if let Some((index, (_, field_ty))) = fields.iter().enumerate().find(|tuple| tuple.1.0 == field.1) {
+            let (field_hir, is_reachable) = self.handle_aggregate_field_pattern(
+                field.2.as_ref(),
+                &field.0,
+                &field.1,
+                &mut is_reachable,
+                field_ty,
+                names
+            )?;
+            
+            Some((
+                HIRPattern::new_de_structure(
+                    self.pass_ty(Type::new_named_type(name.clone()))?,
+                    true,
+                    vec![(self.name(&field.1), index, field_hir, self.pass_ty(field_ty.clone())?)],
+                ),
+                is_reachable
+            ))
+        } else {
+            self.add_error(
+                CheckerError::InvalidUnionField{ 
+                    uni: name.clone(),
+                    field: field.1.clone(),
+                }
+            );
+            None
         }
     }
 
@@ -1374,6 +2170,25 @@ impl Checker {
         return matches!(ty, Type::Void | Type::Universe);
     }
 
+    /// Returns `Some` with the type if it is aggregate.
+    fn type_is_aggregate(&mut self, ty: Type) -> Option<HIRType> {
+        if let Type::NamedType(t) = &ty {
+            if let Some(Member::Type(actt)) = self.ctx.lookup_member(&t.index()) {
+                if let CtxUserType { ty: UserType::Struct(Struct { .. }), .. } = &*actt.borrow() {
+                    Some(self.pass_ty(ty)?)
+                } else if let CtxUserType { ty: UserType::Union(..), .. } = &*actt.borrow() {
+                    Some(self.pass_ty(ty)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     /// Returns if two types are the same.
     fn types_are_same(&mut self, at: &Loc, lhs: &Type, rhs: &Type) -> Option<bool> {
         match self.ctx.types_are_equal(at, lhs, rhs) {
@@ -1412,7 +2227,17 @@ impl Checker {
         let current_return_type = self.ctx.current_function_return_type();
         if let Some(expr) = &ret.expr {
             let (returned_type, _expr_reachability, hir_expr) =
-                self.pass_expr(&expr, ExprState::IsExpr)?;
+                self.pass_expr(&expr, ExprState::IsExpr, None)?;
+
+            if let Type::Pointer { lifetime: Some(_), .. } = &returned_type {
+                self.add_error(
+                    CheckerError::CantReturnPtrToLocalResource(
+                        ret.ret_kw.clone(),
+                        returned_type.clone(),
+                    )
+                )
+            }
+
             if current_return_type != returned_type {
                 self.add_error(CheckerError::ReturningDiffTypeThanDecl {
                     at: ret.ret_kw.clone(),
@@ -1428,19 +2253,7 @@ impl Checker {
                     HIRExpr::Return(HIRReturnExpr {
                         ret_kw: ret.ret_kw.clone(),
                         expr: Some(Box::new(hir_expr)),
-                        aggregate: if let Type::NamedType(t) = &current_return_type {
-                            if let Some(Member::Type(actt)) = self.ctx.lookup_member(&t.index()) {
-                                if let CtxUserType { ty: UserType::Struct { .. }, .. } = &*actt.borrow() {
-                                    Some(self.pass_ty(current_return_type)?)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        },
+                        aggregate: self.type_is_aggregate(current_return_type),
                     }),
                 ))
             }
@@ -1467,7 +2280,7 @@ impl Checker {
 
     /// Gets the type of the variable
     fn get_type_of_var(&mut self, loc: &Loc, name: &NameIndex, set_init: bool) -> Option<Type> {
-        if let Some(var) = self.ctx.lookup_variable_mut(name) {
+        if let Some((var, _)) = self.ctx.lookup_variable_mut(name) {
             let Variable { ty, init, .. } = var;
 
             // set to initialized if specified
@@ -1500,20 +2313,23 @@ impl Checker {
     ///
     /// If `set_init` os true, it sets the variable to an
     /// initialized state.
+    /// 
+    /// The `usize` item is the index of the scope of the
+    /// variable at its declaration.
     fn get_var(
         &mut self,
         loc: &Loc,
         name: &NameIndex,
         set_init: bool,
         addrof: bool,
-    ) -> Option<(Type, HIRExpr, Option<Loc>, bool)> {
+    ) -> Option<(Type, HIRExpr, Option<Loc>, bool, usize)> {
         if let Some(var) = self.ctx.lookup_variable_mut(name) {
-            let Variable {
+            let (Variable {
                 ty,
                 init,
                 is_argument,
                 mutability,
-            } = var;
+            }, scope_index) = var;
 
             let was_init = *init;
 
@@ -1548,11 +2364,7 @@ impl Checker {
                                 HIRExpr::new_argument(
                                     self.collection.unwrap_get(*name).to_string(),
                                     param_ty,
-                                    if let HIRType::Struct(_) = self.pass_ty(self.ctx.func_ret_ty())? {
-                                        index + 1
-                                    } else {
-                                        index
-                                    },
+                                    index + self.type_is_aggregate(self.ctx.func_ret_ty()).map(|_| 1).unwrap_or_default(),
                                 )
                             } else {
                                 HIRExpr::Variable(
@@ -1567,11 +2379,7 @@ impl Checker {
                             HIRExpr::new_argument(
                                 self.collection.unwrap_get(*name).to_string(),
                                 param_ty,
-                                if let HIRType::Struct(_) = self.pass_ty(self.ctx.func_ret_ty())? {
-                                    index + 1
-                                } else {
-                                    index
-                                },
+                                index + self.type_is_aggregate(self.ctx.func_ret_ty()).map(|_| 1).unwrap_or_default(),
                             )
                         } else {
                             HIRExpr::Variable(
@@ -1586,6 +2394,7 @@ impl Checker {
                         var.mutability
                     },
                     was_init,
+                    scope_index,
                 ))
             } else {
                 // return okay if variable is init
@@ -1599,11 +2408,7 @@ impl Checker {
                                 HIRExpr::new_argument(
                                     self.collection.unwrap_get(*name).to_string(),
                                     param_ty,
-                                    if let HIRType::Struct(_) = self.pass_ty(self.ctx.func_ret_ty())? {
-                                        index + 1
-                                    } else {
-                                        index
-                                    },
+                                    index + self.type_is_aggregate(self.ctx.func_ret_ty()).map(|_| 1).unwrap_or_default(),
                                 )
                             } else {
                                 HIRExpr::Variable(
@@ -1618,11 +2423,7 @@ impl Checker {
                             HIRExpr::new_argument(
                                 self.collection.unwrap_get(*name).to_string(),
                                 param_ty,
-                                if let HIRType::Struct(_) = self.pass_ty(self.ctx.func_ret_ty())? {
-                                    index + 1
-                                } else {
-                                    index
-                                },
+                                index + self.type_is_aggregate(self.ctx.func_ret_ty()).map(|_| 1).unwrap_or_default(),
                             )
                         } else {
                             HIRExpr::Variable(
@@ -1637,13 +2438,14 @@ impl Checker {
                         var.mutability
                     },
                     was_init,
+                    scope_index,
                 ))
             }
         } else if let Some(Member::Function(func)) = self.ctx.lookup_member(name) {
             let passed_proto = self.pass_proto(func.borrow().proto(), &func);
             let ty = Type::new_function_pointer(func.borrow().proto().clone());
             let name_of_function = func.borrow().full_name(&self.collection);
-            Some((ty, HIRExpr::GlobalFunc(name_of_function, passed_proto?), None, true))
+            Some((ty, HIRExpr::GlobalFunc(name_of_function, passed_proto?), None, true, 0))
         } else {
             None
         }
@@ -1669,6 +2471,10 @@ impl Checker {
     /// to the vector of warnings.
     fn add_warning(&mut self, warning: WarningOrError) {
         self.warnings.push(warning);
+    }
+
+    fn name(&self, name: &Identifier) -> String {
+        self.collection.unwrap_get(name.index()).to_string()
     }
 }
 
@@ -1743,7 +2549,7 @@ pub enum CheckerError {
     /// Cannot take address of rvalue expression.
     CantTakeAddrOfRvalExpr(Loc),
     /// Int literal too big for target type.
-    LitTooBigForTy(IntLit, Type),
+    LitTooBigForTy(IntLit, Type, u64),
     /// Member not found
     MemberNotFound(Loc, NameIndex),
     /// Cannot use a binary operator on different types.
@@ -1804,13 +2610,14 @@ pub enum CheckerError {
     StructFieldRedefinition {
         name: Identifier,
         field: Identifier,
+        for_: &'static str,
     },
     /// This named type was not found
     /// in the current namespace.
     NamedTypeNotFound(Identifier),
     /// Accessing property of non-struct
     /// type.
-    AccPropOfNonStructTy(Loc, Type),
+    AccPropOfNonAggrTy(Loc, Type),
     /// Property does not exist at the
     /// struct specified.
     NoSuchPropAtStruct(Type, Identifier),
@@ -1847,9 +2654,75 @@ pub enum CheckerError {
         field_name: Identifier,
         supplied_ty: Type,
         expected_ty: Type,
+        instantiating: &'static str,
     },
     /// Dereference non ptr type.
     DerefNonPtrTy(Loc, Type),
+    /// Only one field can be specified when 
+    /// instantiating an union.
+    UnionMultipleFieldInstantiation(Loc),
+    /// The union type does not have a field
+    /// named this.
+    InvalidUnionField {
+        uni: Identifier,
+        field: Identifier
+    },
+    /// Integer type does not support negative
+    /// numbers.
+    IntTyNonNeg(IntLit, Type),
+    /// Lifetime of pointer assigned to variable
+    /// is smaller than the lifetime of the variable
+    /// itself.
+    LifetimeOfVariableGreaterThanOfPointer(Loc, Type, Type),
+    /// Cannot return a pointer to local resources.
+    CantReturnPtrToLocalResource(Loc, Type),
+    /// Pattern is not valid for the switched on value.
+    InvalidPatForTy {
+        loc: Loc,
+        switched_on: Type,
+        pattern_ty: Type,
+    },
+    /// Type of range start is different than the one
+    /// of the range end.
+    RangeEndsTyDiff {
+        begin_ty: Type,
+        range: Loc,
+        end_ty: Type,
+    },
+    /// Literal type does not support range matching.
+    LitDoesntSupportRange(Loc, Type),
+    /// Left value of range has a bigger value than
+    /// the one in the right.
+    LeftGreaterThanRightInRange(Loc),
+    /// Range exclusive can't have left value equal
+    /// to the right value.
+    RangeExclusiveWithEqualEnds(Loc),
+    /// Struct fields were not matched in pattern.
+    StructFieldsNotMatchedInPat {
+        name: Identifier,
+        expected: usize,
+        found: usize,
+    },
+    /// Too many struct fields specified in pattern.
+    TooManyStructFieldsMatchedInPat {
+        name: Identifier,
+        expected: usize,
+        found: usize,
+    },
+    /// No fields provided for union pattern.
+    NoFieldsSpecifiedToUnionPattern {
+        name: Identifier,
+    },
+    /// Too many fields specified for union
+    /// pattern.
+    TooManyFieldsSpecifiedForUnionPattern {
+        name: Identifier,
+        amount: usize,
+    },
+    /// Cannot match on aliased types.
+    MatchingOnAlias(Identifier),
+    /// Unreachable case pattern.
+    UnreachableCasePattern(Loc),
 }
 
 impl CheckerError {
@@ -1863,13 +2736,13 @@ impl CheckerError {
                     match addmember {
                         AddMemberError::AlreadyExists(name, _member) => {
                             format!(
-                                "The name '{}' already exists inside the namespace",
+                                "[EE002] The name '{}' already exists inside the namespace",
                                 collection.unwrap_get(*name),
                             )
                         }
                         AddMemberError::ChildCollision(name, _member) => {
                             format!(
-                                "The name '{}' collides with a child namespace of the same name",
+                                "[EE003] vThe name '{}' collides with a child namespace of the same name",
                                 collection.unwrap_get(*name)
                             )
                         }
@@ -1878,27 +2751,27 @@ impl CheckerError {
             }
             CE::InvalidExpressionAsStatement(loc, msg) => {
                 format!(
-                    "{}Error: Invalid use of expression as statement: {}",
+                    "{}Error: [EE004] Invalid use of expression as statement: {}",
                     loc_to_string(loc, collection),
                     msg
                 )
             }
             CE::InvalidExpressionAsValue(loc, msg) => {
                 format!(
-                    "{}Error: Invalid use of expression as value: {}",
+                    "{}Error: [EE005] Invalid use of expression as value: {}",
                     loc_to_string(loc, collection),
                     msg
                 )
             }
             CE::CantTakeAddrOfRvalExpr(loc) => {
                 format!(
-                    "{}Error: Cannot take address of an rvalue",
+                    "{}Error: [EE006] Cannot take address of an rvalue",
                     loc_to_string(loc, collection)
                 )
             }
-            CE::LitTooBigForTy(lit, ty) => {
+            CE::LitTooBigForTy(lit, ty, maxvalue) => {
                 format!(
-                    "{}Error: Literal too '{}' too big for type '{}'",
+                    "{}Error: [EE007] Literal '{}' too big for type '{}' which has a maximum possible value of '{maxvalue}'",
                     loc_to_string(&lit.0, collection),
                     lit.1,
                     ty_to_string(ty, collection)
@@ -1906,14 +2779,14 @@ impl CheckerError {
             }
             CE::MemberNotFound(loc, name) => {
                 format!(
-                    "{}Error: Member '{}' not found",
+                    "{}Error: [EE008] Member '{}' not found",
                     loc_to_string(loc, collection),
                     collection.unwrap_get(*name)
                 )
             }
             CE::BinOnDiffTys(loc, lhs, rhs) => {
                 format!(
-                    "{}Error: Cannot use binary operator on different types '{}' and '{}'",
+                    "{}Error: [EE009] Cannot use binary operator on different types '{}' and '{}'",
                     loc_to_string(loc, collection),
                     ty_to_string(lhs, collection),
                     ty_to_string(rhs, collection),
@@ -1921,21 +2794,21 @@ impl CheckerError {
             }
             CE::CallNonFunc(loc, ty) => {
                 format!(
-                    "{}Error: Cannot call non-function type '{}'",
+                    "{}Error: [EE010] Cannot call non-function type '{}'",
                     loc_to_string(loc, collection),
                     ty_to_string(ty, collection)
                 )
             }
             CE::FuncGotDiffParamSizeThanInProto { call_at, in_proto, received, type_of_func_is } => {
                 format!(
-                    "{}Error: The type '{}' specifies '{in_proto}' arguments but '{received}' parameters were given to the call",
+                    "{}Error: [EE011] The type '{}' specifies '{in_proto}' arguments but '{received}' parameters were given to the call",
                     loc_to_string(call_at, collection),
                     ty_to_string(type_of_func_is, collection)
                 )
             }
             CE::WrongParamTy { param, expected, received, expr_loc } => {
                 format!(
-                    "{}Error: Wrong type for parameter '{}': expected type '{}' but received type '{}'",
+                    "{}Error: [EE012] Wrong type for parameter '{}': expected type '{}' but received type '{}'",
                     loc_to_string(expr_loc, collection),
                     collection.unwrap_get(*param),
                     ty_to_string(expected, collection),
@@ -1944,7 +2817,7 @@ impl CheckerError {
             }
             CE::AssignWrongTy { slot_ty, expr_loc, expr_ty } => {
                 format!(
-                    "{}Error: Cannot assign to an lvalue of type '{}' a value of type '{}'",
+                    "{}Error: [EE013] Cannot assign to an lvalue of type '{}' a value of type '{}'",
                     loc_to_string(expr_loc, collection),
                     ty_to_string(slot_ty, collection),
                     ty_to_string(expr_ty, collection),
@@ -1952,21 +2825,21 @@ impl CheckerError {
             }
             CE::ChangeConst { lvalue_ty, loc } => {
                 format!(
-                    "{}Error: Cannot assign to constant lvalue reference type '{}'",
+                    "{}Error: [EE014] Cannot assign to constant lvalue reference type '{}'",
                     loc_to_string(loc, collection),
                     ty_to_string(lvalue_ty, collection)
                 )
             }
             CE::UndefinedName(name) => {
                 format!(
-                    "{}Error: Undefined name '{}'",
+                    "{}Error: [EE015] Undefined name '{}'",
                     loc_to_string(&name.0, collection),
                     collection.unwrap_get(name.1),
                 )
             }
             CE::CantUseBinOpOnTy(loc, op, ty) => {
                 format!(
-                    "{}Error: Binary operator '{}' cannot be used in instance of type '{}'",
+                    "{}Error: [EE016] Binary operator '{}' cannot be used in instance of type '{}'",
                     loc_to_string(loc, collection),
                     op.to_string(),
                     ty_to_string(ty, collection),
@@ -1974,14 +2847,14 @@ impl CheckerError {
             }
             CE::SlotRedefinition(name) => {
                 format!(
-                    "{}Error: Can't redefine the named slot '{}'",
+                    "{}Error: [EE017] Can't redefine the named slot '{}'",
                     loc_to_string(&name.0, collection),
                     collection.unwrap_get(name.1),
                 )
             }
             CE::CantHaveValuelessSlot(loc, ty) => {
                 format!(
-                    "{}Error: Cannot use the valueless type '{}' as the type of a slot",
+                    "{}Error: [EE018] Cannot use the valueless type '{}' as the type of a slot",
                     loc_to_string(loc, collection),
                     ty_to_string(ty, collection),
                 )
@@ -1994,13 +2867,13 @@ impl CheckerError {
             }
             CE::StmtIsUnreachable(loc) => {
                 format!(
-                    "{}Error: Everything from now on is unreachable",
+                    "{}Error: [EE019] Everything from now on is unreachable",
                     loc_to_string(loc, collection)
                 )
             }
             CE::ReturningDiffTypeThanDecl { at: loc, decl, ret } => {
                 format!(
-                    "{}Error: Returned type '{}' does not match expected return type '{}' specified in function prototype",
+                    "{}Error: [EE020] Returned type '{}' does not match expected return type '{}' specified in function prototype",
                     loc_to_string(loc, collection),
                     ty_to_string(ret, collection),
                     ty_to_string(decl, collection),
@@ -2008,41 +2881,41 @@ impl CheckerError {
             }
             CE::UsingUnreachableExprAsVal(loc) => {
                 format!(
-                    "{}Error: Unreachable expression cannot be used as a value",
+                    "{}Error: [EE021] Unreachable expression cannot be used as a value",
                     loc_to_string(loc, collection),
                 )
             }
             CE::DoesNotRetInAllPathsButMust { loc, expected_ty } => {
                 format!(
-                    "{}Error: Function declared to return non-valueless type '{}', but a value is not returned in all code paths",
+                    "{}Error: [EE022] Function declared to return non-valueless type '{}', but a value is not returned in all code paths",
                     loc_to_string(loc, collection),
                     ty_to_string(expected_ty, collection),
                 )
             }
             CE::CondIsntBool(loc, cond) => {
                 format!(
-                    "{}Error: Value of type '{}' was used as a condition but a value of type 'bool' was expected",
+                    "{}Error: [EE023] Value of type '{}' was used as a condition but a value of type 'bool' was expected",
                     loc_to_string(loc, collection),
                     ty_to_string(cond, collection)
                 )
             }
             CE::ZeroSizedTypeArray(loc, subty) => {
                 format!(
-                    "{}Error: Valueless type '{}' cannot be used as an element type for sized arrays",
+                    "{}Error: [EE024] Valueless type '{}' cannot be used as an element type for sized arrays",
                     loc_to_string(loc, collection),
                     ty_to_string(subty, collection)
                 )
             }
             CE::NegativeSizedArray(loc, len) => {
                 format!(
-                    "{}Error: Negative integer '{}' cannot be used as the size of an array",
+                    "{}Error: [EE025] Negative integer '{}' cannot be used as the size of an array",
                     loc_to_string(loc, collection),
                     len.1
                 )
             }
-            CE::StructFieldRedefinition { name, field } => {
+            CE::StructFieldRedefinition { name, field, for_ } => {
                 format!(
-                    "{}Error: Redefinition of field '{}' for struct '{}'",
+                    "{}Error: [EE026] Redefinition of field '{}' for {for_} '{}'",
                     loc_to_string(field.loc(), collection),
                     collection.unwrap_get(field.index()),
                     collection.unwrap_get(name.index()),
@@ -2050,21 +2923,21 @@ impl CheckerError {
             }
             CE::NamedTypeNotFound(ty) => {
                 format!(
-                    "{}Error: Named type '{}' was not found within the current namespace",
+                    "{}Error: [EE027] Named type '{}' was not found within the current namespace",
                     loc_to_string(ty.loc(), collection),
                     collection.unwrap_get(ty.index())
                 )
             }
-            CE::AccPropOfNonStructTy(loc, ty) => {
+            CE::AccPropOfNonAggrTy(loc, ty) => {
                 format!(
-                    "{}Error: Cannot access property of non-struct type '{}'",
+                    "{}Error: [EE028] Cannot access property of non-aggregate type '{}'",
                     loc_to_string(loc, collection),
                     ty_to_string(ty, collection),
                 )
             }
             CE::NoSuchPropAtStruct(ty, prop) => {
                 format!(
-                    "{}Error: Struct '{}' doesn't have a property named '{}'",
+                    "{}Error: [EE029] Struct '{}' doesn't have a property named '{}'",
                     loc_to_string(prop.loc(), collection),
                     ty_to_string(ty, collection),
                     collection.unwrap_get(prop.index()),
@@ -2072,14 +2945,14 @@ impl CheckerError {
             }
             CE::GenericFunctionNotFound(name) => {
                 format!(
-                    "{}Error: Generic function '{}' was not found",
+                    "{}Error: [EE030] Generic function '{}' was not found",
                     loc_to_string(name.loc(), collection),
                     collection.unwrap_get(name.index()),
                 )
             }
             CE::InvalidTemplParamLen { name, expected, found } => {
                 format!(
-                    "{}Error: Generic function '{}' expected {} template arguments but received {}",
+                    "{}Error: [EE031] Generic function '{}' expected {} template arguments but received {}",
                     loc_to_string(name.loc(), collection),
                     collection.unwrap_get(name.index()),
                     expected,
@@ -2088,14 +2961,14 @@ impl CheckerError {
             }
             CE::InstantiatingNonStructType(ty) => {
                 format!(
-                    "{}Error: Could not instantiate the type '{}' as it is not a structure",
+                    "{}Error: [EE032] Could not instantiate the type '{}' as it is not a structure",
                     loc_to_string(ty.loc(), collection),
                     collection.unwrap_get(ty.index()),
                 )
             }
             CE::WrongFieldNumberForStruct { name, received, needed } => {
                 format!(
-                    "{}Error: Struct '{}' expected {} fields but received {} during instantiation",
+                    "{}Error: [EE033] Struct '{}' expected {} fields but received {} during instantiation",
                     loc_to_string(name.loc(), collection),
                     collection.unwrap_get(name.index()),
                     needed,
@@ -2104,7 +2977,7 @@ impl CheckerError {
             }
             CE::FieldNotProvidedWhenInstantiating { struct_name, field, ty } => {
                 format!(
-                    "{}Error: When instantiating the struct '{}' the field '{}' of type '{}' was not provided",
+                    "{}Error: [EE034] When instantiating the struct '{}' the field '{}' of type '{}' was not provided",
                     loc_to_string(field.loc(), collection),
                     collection.unwrap_get(struct_name.index()),
                     collection.unwrap_get(field.index()),
@@ -2113,15 +2986,15 @@ impl CheckerError {
             }
             CE::RepeatedFieldInInstantiation { field, provided } => {
                 format!(
-                    "{}Error: Field '{}' was provided {} times instead of one",
+                    "{}Error: [EE035] Field '{}' was provided {} times instead of one",
                     loc_to_string(field.loc(), collection),
                     collection.unwrap_get(field.index()),
                     provided,
                 )
             }
-            CE::WrongTyForField { struct_name, field_name, supplied_ty, expected_ty } => {
+            CE::WrongTyForField { struct_name, field_name, supplied_ty, expected_ty, instantiating } => {
                 format!(
-                    "{}Error: The type '{}' was expected for the field '{}' but '{}' was received when instantiating the struct '{}'",
+                    "{}Error: [EE036] The type '{}' was expected for the field '{}' but '{}' was received when instantiating the {instantiating} '{}'",
                     loc_to_string(field_name.loc(), collection),
                     ty_to_string(expected_ty, collection),
                     collection.unwrap_get(field_name.index()),
@@ -2131,9 +3004,127 @@ impl CheckerError {
             }
             CE::DerefNonPtrTy(deref_tok, base) => {
                 format!(
-                    "{}Error: Cannot dereference the non-pointer type '{}'",
+                    "{}Error: [EE037] Cannot dereference the non-pointer type '{}'",
                     loc_to_string(deref_tok, collection),
                     ty_to_string(base, collection),
+                )
+            }
+            CE::UnionMultipleFieldInstantiation(loc) => {
+                format!(
+                    "{}Error: [EE038] Only one field can be specified when instantiating an union",
+                    loc_to_string(loc, collection),
+                )
+            }
+            CE::InvalidUnionField { uni, field } => {
+                format!(
+                    "{}Error: [EE039] Invalid field '{}' for union '{}'",
+                    loc_to_string(field.loc(), collection),
+                    collection.unwrap_get(field.index()),
+                    collection.unwrap_get(uni.index()),
+                )
+            }
+            CE::IntTyNonNeg(lit, ty) => {
+                format!(
+                    "{}Error: [EE040] Type '{}' does not support negative numbers: '{}'",
+                    loc_to_string(&lit.0, collection),
+                    ty_to_string(ty, collection),
+                    lit.2,
+                )
+            }
+            CE::LifetimeOfVariableGreaterThanOfPointer(ampersand, variable_ty, pointer_ty) => {
+                format!(
+                    "{}Error: [EE041] Cannot assign a pointer '{}' to something of type '{}' whose lifetime is greater than the one of the assigned pointer",
+                    loc_to_string(ampersand, collection),
+                    ty_to_string(pointer_ty, collection),
+                    ty_to_string(variable_ty, collection),
+                )
+            }
+            CE::CantReturnPtrToLocalResource(ret_kw, ty) => {
+                format!(
+                    "{}Error: [EE042] Cannot return from function a pointer of type '{}' which points to a resource only available locally",
+                    loc_to_string(ret_kw, collection),
+                    ty_to_string(ty, collection),
+                )
+            }
+            CE::InvalidPatForTy { loc, switched_on, pattern_ty } => {
+                format!(
+                    "{}Error: [EE043] Switched on value is of type '{}' but pattern requires a value of type '{}'",
+                    loc_to_string(loc, collection),
+                    ty_to_string(switched_on, collection),
+                    ty_to_string(pattern_ty, collection),
+                )
+            }
+            CE::RangeEndsTyDiff { begin_ty, range, end_ty } => {
+                format!(
+                    "{}Error: [EE044] Types from beginning of the range ('{}') and from the end of the range ('{}') differ",
+                    loc_to_string(range, collection),
+                    ty_to_string(begin_ty, collection),
+                    ty_to_string(end_ty, collection),
+                )
+            }
+            CE::LitDoesntSupportRange(loc, ty) => {
+                format!(
+                    "{}Error: [EE045] Literal of type '{}' doesn't support being in a range",
+                    loc_to_string(loc, collection),
+                    ty_to_string(ty, collection),
+                )
+            }
+            CE::LeftGreaterThanRightInRange(loc) => {
+                format!(
+                    "{}Error: [EE046] Left side cannot be greater than the right side in a range",
+                    loc_to_string(loc, collection),
+                )
+            }
+            CE::RangeExclusiveWithEqualEnds(loc) => {
+                format!(
+                    "{}Error: [EE047] Range exclusive does not allow for both ends to be equal",
+                    loc_to_string(loc, collection)
+                )
+            }
+            CE::StructFieldsNotMatchedInPat { name, expected, found } => {
+                format!(
+                    "{}Error: [EE048] Too little fields were found when matching the struct '{}': {} fields were expected but {} were found",
+                    loc_to_string(name.loc(), collection),
+                    collection.unwrap_get(name.index()),
+                    expected,
+                    found,
+                )
+            }
+            CE::TooManyStructFieldsMatchedInPat { name, expected, found } => {
+                format!(
+                    "{}Error: [EE048] Too many fields were found when matching the struct '{}': {} fields were expected but {} were found",
+                    loc_to_string(name.loc(), collection),
+                    collection.unwrap_get(name.index()),
+                    expected,
+                    found,
+                )
+            }
+            CE::NoFieldsSpecifiedToUnionPattern { name } => {
+                format!(
+                    "{}Error: [EE049] No fields specified when matching union '{}'",
+                    loc_to_string(name.loc(), collection),
+                    collection.unwrap_get(name.index()),
+                )
+            }
+            CE::TooManyFieldsSpecifiedForUnionPattern { name, amount } => {
+                format!(
+                    "{}Error: [EE050] Too many fields specified when matching the union '{}': expected only one but found '{}'",
+                    loc_to_string(name.loc(), collection),
+                    collection.unwrap_get(name.index()),
+                    amount
+                )
+            }
+            CE::MatchingOnAlias(name) => {
+                format!(
+                    "{}Error: [EE051] Cannot pattern match using '{}' which is an alias",
+                    loc_to_string(name.loc(), collection),
+                    collection.unwrap_get(name.index()),
+                )
+            }
+            CE::UnreachableCasePattern(loc) => {
+                format!(
+                    "{}Error: [EE052] Case pattern is unreachable",
+                    loc_to_string(loc, collection),
                 )
             }
         }).to_string()
@@ -2195,14 +3186,19 @@ fn ty_to_string(ty: &Type, collection: &Collection) -> String {
         } => {
             format!("[{} of {}]", size.1, ty_to_string(element_type, collection))
         }
-        T::Pointer { pointee, mutability } => format!(
-            "{}*{}",
+        T::Pointer { pointee, mutability, lifetime } => format!(
+            "{}*{}{}",
             if mutability.is_some() {
                 "mut "
             } else {
                 ""
             },
-            ty_to_string(pointee, collection)
+            ty_to_string(pointee, collection),
+            if let Some(lifetime) = lifetime {
+                format!(" @{lifetime}")
+            } else {
+                "".to_string()
+            },
         ),
         T::FunctionPointer(proto) => format!(
             "func({}) {}",
@@ -2237,7 +3233,7 @@ impl WarningOrError {
         }).paint(match self {
             WOR::AccessingUninitializedSlot(loc, name, ty) => {
                 format!(
-                    "{}{prologue}: Accessing uninitialized slot '{}' of type '{}' before assignment",
+                    "{}{prologue}: [WE001] Accessing uninitialized slot '{}' of type '{}' before assignment",
                     loc_to_string(loc, collection),
                     collection.unwrap_get(*name),
                     ty_to_string(ty, collection),
@@ -2245,10 +3241,20 @@ impl WarningOrError {
             }
             WOR::LoopOnlyExecutesOnce(loc) => {
                 format!(
-                    "{}{prologue}: Loop body only executes once",
+                    "{}{prologue}: [WE002] Loop body only executes once",
                     loc_to_string(loc, collection),
                 )
             }
         }).to_string()
     }
+}
+
+/// The result of passing through a case.
+pub struct CaseResult {
+    /// This case in HIR.
+    case: HIRCase,
+    /// If the pattern is reachable (allows for more cases).
+    pattern_is_reachable: bool,
+    /// If the block is reachable (e.g., for example, we return from it).
+    block_is_reachable: Reachability,
 }

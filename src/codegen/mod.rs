@@ -30,20 +30,18 @@ use std::{
 
 use derive_getters::Getters;
 use inkwell::{
-    attributes::{Attribute, AttributeLoc}, builder::Builder, context::{AsContextRef, Context}, llvm_sys::{core::{LLVMAddAttributeAtIndex, LLVMCreateEnumAttribute, LLVMCreateTypeAttribute, LLVMGetEnumAttributeValue}, target::LLVMStoreSizeOfType, target_machine::LLVMGetHostCPUFeatures}, module::{Linkage, Module}, targets::{
+    attributes::{Attribute, AttributeLoc}, basic_block::BasicBlock, builder::Builder, context::{AsContextRef, Context}, data_layout::DataLayout, llvm_sys::{core::{LLVMAddAttributeAtIndex, LLVMCreateEnumAttribute, LLVMCreateTypeAttribute, LLVMGetEnumAttributeValue}, target::LLVMStoreSizeOfType, target_machine::LLVMGetHostCPUFeatures}, module::{Linkage, Module}, targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine, TargetTriple
-    }, types::{AnyType, AnyTypeEnum, ArrayType, AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType}, values::{AnyValue, AnyValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue}, AddressSpace, OptimizationLevel
+    }, types::{AnyType, AnyTypeEnum, ArrayType, AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType}, values::{AnyValue, AnyValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue}, AddressSpace, OptimizationLevel
 };
 
 use crate::{
     ast::{
-        expr::{BinaryOp, LiteralExpr},
-        typing::{PrimType, TypeBits},
+        expr::{BinaryOp, Conditional, LiteralExpr},
+        typing::{PrimType, TypeBits}, Loc,
     },
     check::hir::{
-        expr::{BinOpType, HIRAssignmentExpr, HIRBinaryExpr, HIRCallExpr, HIRExpr, HIRReturnExpr},
-        typing::HIRType,
-        HIRDecl, HIRFunctionDecl, HIRPrototype,
+        expr::{BinOpType, HIRAsReferenceExpr, HIRAssignmentExpr, HIRBinaryExpr, HIRCallExpr, HIRConditional, HIRExpr, HIRLiteralExpr, HIRReturnExpr, HIRWhileLoop}, matcher::{HIRCase, HIRPattern, HIRSwitch}, typing::HIRType, HIRBlock, HIRDecl, HIRFunctionDecl, HIRPrototype
     },
 };
 
@@ -52,6 +50,7 @@ use self::llvm::Holder;
 mod llvm;
 
 #[repr(u32)]
+/// All of the current LLVM attributes.
 pub enum AttributeKind {
     None = 0,
     AllocAlign,
@@ -145,6 +144,73 @@ pub enum AttributeKind {
     LastIntAttr,
 }
 
+#[repr(u32)]
+/// All of the current LLVM calling conventions.
+pub enum CallingConvention {
+    C = 0,
+    Fast = 8,
+    Cold = 9,
+    GHC = 10,
+    HiPE = 11,
+    AnyReg = 13,
+    PreserveMost = 14,
+    PreserveAll = 15,
+    Swift = 16,
+    CxxFastTLS = 17,
+    Tail = 18,
+    CFGuardCheck = 19,
+    SwiftTail = 20,
+    PreserveNone = 21,
+    
+    // first targeted cc
+    X86StdCall = 64,
+    X86FastCall = 65,
+    ARMAPCS = 66,
+    ArmAapcs = 67,
+    ArmAapcsVfp = 68,
+    Msp430Intr = 69,
+    X86ThisCall = 70,
+    PTXKernel = 71,
+    PTXDevice = 72,
+    SPIRFUNC = 75,
+    SPIRKERNEL = 76,
+    IntelOCLBI = 77,
+    X64SysV = 78,
+    Win64 = 79,
+    X86VectorCall = 80,
+    DummyHhvm = 81,
+    DummyHhvmC = 82,
+    X86Intr = 83,
+    AVRIntr = 84,
+    AVRSignal = 85,
+    AVRBuiltin = 86,
+    AMDGpuVs = 87,
+    AMDGpuGs = 88,
+    AMDGpuPs = 89,
+    AMDGpuCs = 90,
+    AMDGpuKernel = 91,
+    X86RegCall = 92,
+    AMDGpuHs = 93,
+    MSP430Builtin = 94,
+    AMDGPULs = 95,
+    AMDGPUEs = 96,
+    AArch64VectorCall = 97,
+    AArch64SVEVectorCall = 98,
+    WASMEmscriptenInvoke = 99,
+    AMDGPUGfx = 100,
+    M68kINTR = 101,
+    AArch64SMEABISupportRoutinesPreserveMostFromX0 = 102,
+    AArch64SMEABISupportRoutinesPreserveMostFromX2 = 103,
+    AMDGPUCSChain = 104,
+    AMDGPUCSChainPreserve = 105,
+    M68kRTD = 106,
+    GRAAL = 107,
+    ARM64ECThunkX64 = 108,
+    ARM64ECThunkNative = 109,
+    RISCVVectorCall = 110,
+    MaxID = 1023
+}
+
 /// A file format to export the file as.
 pub enum ExportFormat {
     // -- llvm specific formats
@@ -169,16 +235,33 @@ pub struct Emmitter<'c> {
     /// What holds all of LLVM's essentials.
     holder: Holder<'c>,
     /// The current scope's variables.
-    scopes: RefCell<Vec<HashMap<String, AnyValueEnum<'c>>>>,
+    scopes: RefCell<Vec<Scope<'c>>>,
+    /// The exporting options we're using.
+    options: ExportOptions,
+}
+
+#[derive(Default)]
+/// A scope in the `Emitter`.
+pub struct Scope<'c> {
+    /// The variables declared at this scope.
+    variables: HashMap<String, AnyValueEnum<'c>>,
+    /// The deferred expressions at this scope and
+    /// if they were already executed or not.
+    deferred: Vec<(HIRExpr, bool)>,
+    /// If this is a function.
+    is_function: bool,
+    /// If this is not a loop or within a
+    /// conditional without an else clause.
+    go_beyond_one_scope: bool,
 }
 
 #[derive(Getters)]
 /// Options to use when exporting.
-pub struct ExportOptions<'a> {
+pub struct ExportOptions {
     /// The file format to export.
     pub format: ExportFormat,
     /// The output file name to use.
-    pub output: &'a str,
+    pub output: String,
     /// The optimization level to apply.
     pub optimization_level: OptimizationLevel,
     /// If we are using position-independent
@@ -190,15 +273,16 @@ pub struct ExportOptions<'a> {
     /// kernel and others.
     pub code_model: CodeModel,
     /// A specified target triple.
-    pub triple: Option<&'a str>,
+    pub triple: Option<String>,
 }
 
 impl<'c> Emmitter<'c> {
     /// Constructs an `Emitter`.
-    pub fn new(context: &'c Context, module_name: &str) -> Self {
+    pub fn new(context: &'c Context, module_name: &str, opts: ExportOptions) -> Self {
         Self {
             holder: Holder::from_context(context, module_name),
             scopes: RefCell::default(),
+            options: opts,
         }
     }
 
@@ -209,14 +293,14 @@ impl<'c> Emmitter<'c> {
     /// Exports the emitted LLVM IR to a file with the
     /// specified file format.
     pub fn export(
-        &'c self,
-        options: &ExportOptions<'c>
+        &'c self
     ) -> Result<(), io::Error> {
+        self.module().print_to_stderr();
         self.module().verify().unwrap();
 
-        let mut file = File::create(options.output())?;
+        let mut file = File::create(self.options.output())?;
 
-        match options.format() {
+        match self.options.format() {
             ExportFormat::LLVMIR => {
                 // write the llvm ir to the file
                 write!(file, "{}", self.module().print_to_string().to_string())?;
@@ -233,14 +317,14 @@ impl<'c> Emmitter<'c> {
                         "Failed to initialize native target".to_string()
                     )
                 })?;
-                let relocation_mode = if *options.use_pie() {
+                let relocation_mode = if *self.options.use_pie() {
                     RelocMode::PIC
                 } else {
                     RelocMode::Default
                 };
-                let code_model = *options.code_model();
-                let out_path = Path::new(options.output());
-                let triple = match options.triple() {
+                let code_model = *self.options.code_model();
+                let out_path = Path::new(self.options.output().as_str());
+                let triple = match self.options.triple() {
                     Some(triple) => {
                         TargetTriple::create(triple)
                     }
@@ -263,7 +347,7 @@ impl<'c> Emmitter<'c> {
                         &triple,
                         &cpu,
                         &features,
-                        options.optimization_level,
+                        self.options.optimization_level,
                         relocation_mode,
                         code_model
                     ).ok_or(
@@ -275,7 +359,7 @@ impl<'c> Emmitter<'c> {
                 target_machine
                     .write_to_file(
                         self.module(),
-                        if let ExportFormat::Object = options.format {
+                        if let ExportFormat::Object = self.options.format {
                             FileType::Object
                         } else {
                             FileType::Assembly
@@ -323,23 +407,40 @@ impl<'c> Emmitter<'c> {
         let block = self.context().append_basic_block(function_value, "");
         self.builder().position_at_end(block);
 
-        self.push_scope();
+        self.push_scope(true, false);
 
         for decl in decl.block.stmts().iter() {
             self.emmit_expr(decl);
         }
 
+        self.if_not_finished(|builder| {
+            builder
+                .build_unreachable()
+                .unwrap();
+        });
+
         self.pop_scope();
+    }
+
+    /// Emmits all of the expressions contained in a block.
+    fn emmit_block(&'c self, block: &HIRBlock) {
+        for expr in block.stmts().iter() {
+            self.emmit_expr(expr);
+        }
     }
 
     /// Gets or defines a function if not yet defined.
     fn get_or_define(&self, func: &str, ty: FunctionType<'c>) -> FunctionValue<'c> {
         match self.holder.module().get_function(func) {
             Some(func) => func,
-            None => self
-                .holder
-                .module()
-                .add_function(func, ty, Some(Linkage::External)),
+            None => {
+                let func = self
+                    .holder
+                    .module()
+                    .add_function(func, ty, Some(Linkage::External));
+                func.set_call_conventions(CallingConvention::Fast as u32);
+                func
+            },
         }
     }
 
@@ -351,7 +452,7 @@ impl<'c> Emmitter<'c> {
 
         // if returns aggregate, use void and take
         // return parameter instead
-        let return_type = if let HIRType::Struct(_) = &**proto.return_type() {
+        let return_type = if let HIRType::AlignedStruct(_) | HIRType::Union(_) = &**proto.return_type() {
             args.push(
                 self.context()
                     .i32_type()
@@ -360,9 +461,13 @@ impl<'c> Emmitter<'c> {
                     .into()
             );
             attrs.push((0,
-                unsafe { Attribute::new(
-                    LLVMCreateEnumAttribute(self.context().as_ctx_ref(), AttributeKind::WriteOnly as u32, 1)
-                ) }
+                self.attribute_for_kind(AttributeKind::WriteOnly)
+            ));
+            attrs.push((0,
+                self.attribute_for_kind(AttributeKind::NoUndef)
+            ));
+            attrs.push((0,
+                self.attribute_for_kind(AttributeKind::NoCapture)
             ));
             add_index += 1;
 
@@ -370,13 +475,14 @@ impl<'c> Emmitter<'c> {
                 .i32_type()
                 .into()
         } else {
-            self.llvm_type(&proto.return_type())
+            let (value, _) = self.llvm_type_argument(&proto.return_type(), true);
+            value
         };
 
         for (idx, arg) in proto.arguments().iter().enumerate() {
-            let (arg_ty, arg_attr) = self.llvm_type_argument(&arg.ty);
+            let (arg_ty, arg_attr) = self.llvm_type_argument(&arg.ty, false);
             args.push(basic_type(arg_ty).into());
-            if let Some(attr) = arg_attr {
+            for attr in arg_attr {
                 attrs.push(
                     (idx + add_index,
                     attr)
@@ -419,14 +525,15 @@ impl<'c> Emmitter<'c> {
                     .array_type(size.1 as u32)
                     .as_any_type_enum()
             }
-            HT::Struct(fields) => {
+            HT::Struct(_) => {
+                unreachable!("Error: unaligned struct type reached the code generation phase")
+            }
+            HT::AlignedStruct(fields) => {
                 self.context()
                     .struct_type(
                         fields.iter()
                             .map(|ty| {
-                                basic_type(
-                                    self.llvm_type(ty)
-                                )
+                                basic_type(self.llvm_type(&ty.0))
                             })
                             .collect::<Vec<_>>()
                             .as_slice(),
@@ -434,7 +541,15 @@ impl<'c> Emmitter<'c> {
                     )
                     .as_any_type_enum()
             }
-            HT::Pointer { pointee, mutability } => BasicTypeEnum::try_from(self.llvm_type(&pointee))
+            HT::Union(_) => {
+                let size_of_self = ty.size();
+                // return opaque type
+                self.context()
+                    .i8_type()
+                    .array_type(size_of_self as u32)
+                    .as_any_type_enum()
+            }
+            HT::Pointer { pointee, mutability: _ } => BasicTypeEnum::try_from(self.llvm_type(&pointee))
                 .unwrap()
                 .ptr_type(AddressSpace::default())
                 .as_any_type_enum(),
@@ -446,46 +561,126 @@ impl<'c> Emmitter<'c> {
 
     /// Gets a type in LLVM for its representation in HIR
     /// for a function argument.
-    fn llvm_type_argument(&'c self, ty: &HIRType) -> (AnyTypeEnum<'c>, Option<Attribute>) {
+    fn llvm_type_argument(&'c self, ty: &HIRType, is_return_type: bool) -> (AnyTypeEnum<'c>, Vec<Attribute>) {
         use HIRType as HT;
-        use PrimType as PT;
-        use TypeBits as TB;
 
         match ty {
             HT::Struct(fields) => {
-                // create struct type
-                let struct_type = self.context()
-                    .struct_type(
-                        fields.iter()
-                            .map(|ty| {
-                                basic_type(
-                                    self.llvm_type(ty)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                        false
-                    )
-                    .as_basic_type_enum();
-                // create byval(Struct) attribute
-                let by_val_attribute = unsafe {
-                    Attribute::new(
-                        LLVMCreateTypeAttribute(self.context().as_ctx_ref(), AttributeKind::ByVal as u32, struct_type.as_type_ref())
-                    )
-                };
-
-                (struct_type.ptr_type(AddressSpace::default()).as_any_type_enum(), Some(by_val_attribute))
+                unreachable!("Error: unaligned struct type reached the code generation phase")
             }
-            _ => (self.llvm_type(ty), None),
+            HT::AlignedStruct(fields) => {
+                if is_return_type {
+                    (self.context().i32_type().as_any_type_enum(), vec!())
+                } else {
+                    // create struct type
+                    let struct_type = self.context()
+                        .struct_type(
+                            fields.iter()
+                                .map(|ty| {
+                                    basic_type(self.llvm_type(&ty.0))
+                                })
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            false
+                        );
+                    // create byval(Struct) attribute
+                    let by_val_attribute = self.attribute_for_type(
+                        AttributeKind::ByVal,
+                        struct_type.into()
+                    );
+
+                    (struct_type.ptr_type(AddressSpace::default()).as_any_type_enum(), vec!(by_val_attribute))
+                }
+            }
+            HT::Pointer { pointee, mutability } => {
+                let pointee = basic_type(self.llvm_type(&pointee));
+                let pointer_type = pointee.ptr_type(AddressSpace::default());
+                // if it is immutable add readonly attribute
+                let attributes = if mutability.is_none() {
+                    vec!(self.attribute_for_kind(AttributeKind::ReadOnly), self.attribute_for_kind(AttributeKind::Dereferenceable))
+                } else {
+                    vec!(self.attribute_for_kind(AttributeKind::Writable))
+                };
+                (pointer_type.as_any_type_enum(), attributes)
+            }
+            _ => (self.llvm_type(ty), vec!()),
         }
     }
 
-    fn push_scope(&self) {
-        self.scopes.borrow_mut().push(Default::default());
+    /// Pushes a new scope to the stack of scopes.
+    fn push_scope(&self, is_function: bool, go_beyond_one_scope: bool) {
+        self.scopes.borrow_mut().push(Scope {
+            is_function,
+            go_beyond_one_scope,
+            ..Default::default()
+        });
     }
 
-    fn pop_scope(&self) {
-        self.scopes.borrow_mut().pop();
+    /// Adds a new deferred expression to the scope.
+    fn add_deferred_expr(&self, expr: HIRExpr) {
+        // add a new deferred
+        // we put false here because it hasn't been
+        // executed yet
+        self.scopes
+            .borrow_mut()
+            .last_mut()
+            .unwrap()
+            .deferred
+            .push((expr, false))
+    }
+
+    /// Pops a scope, executing all of the deferred
+    /// expressions declared in reverse order of
+    /// declaration.
+    fn pop_scope(&'c self) {
+        let mut binding = self.scopes.borrow_mut();
+        let last_scope = binding
+            .last_mut()
+            .unwrap();
+
+        // go through deferred of last scope
+        while let Some((deferred, was_executed)) = last_scope.deferred.pop() {
+            // only do defer if wasn't already executed
+            if !was_executed {
+                self.emmit_expr(&deferred);
+            }
+        }
+
+        binding.pop();
+    }
+
+    /// Does all defers for the variables declared until now
+    /// within the current function.
+    fn do_ret_defers(&'c self) {
+        let mut binding = self.scopes.borrow_mut();
+        let mut iterator = binding.iter_mut().rev().enumerate();
+
+        let mut go_beyond_one_scope = true;
+
+        // go through all scopes of this function
+        while let Some((scope_index, scope)) = iterator.next() {
+            // execute defer statements in this scope
+            for (deferred, was_executed) in scope.deferred.iter_mut().rev() {
+                if !*was_executed {
+                    self.emmit_expr(deferred);
+                    // go_beyond_one_scope is true for function declarations
+                    // or conditions which have an else clause
+                    //
+                    // false for loops and conditionals w/o else clause
+                    if (scope.go_beyond_one_scope && go_beyond_one_scope) || scope_index == 0 {
+                        *was_executed = true;
+                    } else {
+                        go_beyond_one_scope = false;
+                    }
+                }
+            }
+
+            // check at end if this is function scope
+            // and then end
+            if scope.is_function {
+                break;
+            }
+        }
     }
 
     /// Emmits machine code for the input expression.
@@ -525,7 +720,31 @@ impl<'c> Emmitter<'c> {
                         .as_any_value_enum()
                 }
             }
-            HE::AccessProperty { struct_expr, struct_ty, property_index, property_ty, must_dereference_struct } => {
+            HE::Switch(switch) => self.emmit_switch(switch),
+            HE::AccessUnionProperty { union_expr, property_ty, must_dereference_first } => {
+                // for accessing a property of a union, we simply
+                // read from it the value we wish to treat it as
+                let union_value = if *must_dereference_first {
+                    self.builder()
+                        .build_load(
+                            self.context().i32_type().ptr_type(AddressSpace::default()),
+                            self.emmit_expr_impl(&union_expr, true).into_pointer_value(),
+                            ""
+                        )
+                        .unwrap()
+                        .as_any_value_enum()
+                } else {
+                    self.emmit_expr_impl(&union_expr, true)
+                };
+                self
+                    .emmit_raw_union_access_property(
+                        union_value.into_pointer_value(),
+                        property_ty,
+                        take_lvalue
+                    )
+                    .as_any_value_enum()
+            }
+            HE::AccessStructProperty { struct_expr, struct_ty, mut property_index, property_ty, must_dereference_first: must_dereference_struct } => {
                 let struct_value = if *must_dereference_struct {
                     self.builder()
                         .build_load(
@@ -534,34 +753,19 @@ impl<'c> Emmitter<'c> {
                             ""
                         )
                         .unwrap()
-                        .as_any_value_enum()
+                        .into_pointer_value()
                 } else {
-                    self.emmit_expr_impl(&struct_expr, true)
+                    self.emmit_expr_impl(&struct_expr, true).into_pointer_value()
                 };
-                let struct_type = self.llvm_type(struct_ty);
-                let property_type = self.llvm_type(property_ty);
-
-                let address = self.builder()
-                    .build_struct_gep(
-                        basic_type(struct_type),
-                        struct_value.into_pointer_value(),
-                        *property_index,
-                        ""
+                self
+                    .emmit_raw_struct_access_property(
+                        struct_value,
+                        struct_ty,
+                        property_index,
+                        property_ty,
+                        take_lvalue
                     )
-                    .unwrap();
-
-                if take_lvalue {
-                    address.as_any_value_enum()
-                } else {
-                    self.builder()
-                        .build_load(
-                            basic_type(property_type),
-                            address,
-                            ""
-                        )
-                        .unwrap()
-                        .as_any_value_enum()
-                }
+                    .as_any_value_enum()
             }
             HE::Argument { name, ty, index } => {
                 if let Some(argument_val) = self.get_var_opt(name.as_str()) {
@@ -575,6 +779,7 @@ impl<'c> Emmitter<'c> {
                         .unwrap()
                         .get_parent()
                         .unwrap();
+
                     // get the argument
                     let argument = current_function
                         .get_nth_param(*index as u32)
@@ -585,7 +790,7 @@ impl<'c> Emmitter<'c> {
                         .unwrap();
 
                     // store the value inside of the local binding
-                    if !arg_type.is_struct_type() {
+                    if !arg_type.is_struct_type() && !arg_type.is_array_type() {
                         // use store if regular type
                         self.builder()
                             .build_store(
@@ -628,6 +833,13 @@ impl<'c> Emmitter<'c> {
                     .position_at_end(insert_point);
                 self.emmit_expr(&expr)
             }
+            HE::Sequence(se) => {
+                let mut last = None;
+                for expr in se {
+                    last = Some(self.emmit_expr(expr));
+                }
+                last.expect("Empty sequence is not valid")
+            }
             HE::Dereference(pointee, pointer) => {
                 self.builder()
                     .build_load(
@@ -638,18 +850,24 @@ impl<'c> Emmitter<'c> {
                     .unwrap()
                     .as_any_value_enum()
             }
+            HE::InstantiateUnion(union_ty, field, is_field_aggr) => self.emmit_instantiate_union(union_ty, field, is_field_aggr.as_ref()),
             HE::InstantiateStruct(ty, fields) => self.emmit_instantiate_struct(ty, fields),
             HE::Return(ret_expr) => self.emmit_ret(ret_expr),
-            // TODO: Implement conditionals and while loops
-            HE::Conditional(cond) => todo!("Conditionals are not yet implemented"),
-            HE::WhileLoop(loo) => todo!("While loops are not yet implemented"),
+            HE::Conditional(cond) => self.emmit_cond(cond),
+            HE::WhileLoop(loo) => self.emmit_while(loo),
+            HE::Defer(deferred) => {
+                self.add_deferred_expr((**deferred).clone());
+                self.const_null()
+            }
         }
     }
 
     /// Emmits a literal as machine code.
-    fn emmit_lit(&'c self, lit: &LiteralExpr) -> AnyValueEnum<'c> {
+    fn emmit_lit(&'c self, lit: &HIRLiteralExpr) -> AnyValueEnum<'c> {
         match lit {
-            LiteralExpr::Int(i) => self.holder.context().i64_type().const_int(i.1 as u64, true),
+            HIRLiteralExpr::Int(t, i) => self.llvm_type(t)
+                .into_int_type()
+                .const_int(i.1 as u64, true),
         }
         .as_any_value_enum()
     }
@@ -674,8 +892,41 @@ impl<'c> Emmitter<'c> {
         }
     }
 
+    /// Emmits the instantiation of an union.
+    fn emmit_instantiate_union(&'c self, hir_union_ty: &HIRType, field: &HIRExpr, is_field_aggr: Option<&HIRType>) -> AnyValueEnum<'c> {
+        let uni_ty = basic_type(self.llvm_type(hir_union_ty));
+        // allocate memory for the struct
+        let uni_mem = self.builder()
+            .build_alloca(uni_ty, "")
+            .unwrap();
+        // evaluate the field
+        let field_value = basic_value(self.emmit_expr(field));
+        // set the index
+        if let Some(aggr) = is_field_aggr {
+            self.builder()
+                .build_memcpy(
+                    uni_mem,
+                    8,
+                    field_value.into_pointer_value(),
+                    8,
+                    self.context()
+                        .i64_type()
+                        .const_int(aggr.size() as u64, false)
+                )
+                .unwrap();
+        } else {
+            self.builder()
+                .build_store(
+                    uni_mem,
+                    field_value,
+                )
+                .unwrap();
+        }
+        uni_mem.as_any_value_enum()
+    }
+
     /// Emmits the instantiation of a struct.
-    fn emmit_instantiate_struct(&'c self, hir_stct_ty: &HIRType, fields: &[HIRExpr]) -> AnyValueEnum<'c> {
+    fn emmit_instantiate_struct(&'c self, hir_stct_ty: &HIRType, fields: &[(HIRExpr, Option<HIRType>)]) -> AnyValueEnum<'c> {
         let stct_ty = basic_type(self.llvm_type(hir_stct_ty));
         // allocate memory for the struct
         let stct_mem = self.builder()
@@ -691,13 +942,31 @@ impl<'c> Emmitter<'c> {
                     ""
                 )
                 .unwrap();
-            let field_value = basic_value(self.emmit_expr(field));
-            self.builder()
-                .build_store(
-                    field_address,
-                    field_value
-                )
-                .unwrap();
+            let field_value = basic_value(self.emmit_expr(&field.0));
+            if let Some(aggr_ty) = &field.1 {
+                // if it is aggregate, memcpy it inside
+                
+                // get size of type
+                let size = self.context().i64_type().const_int(aggr_ty.size() as u64, false);
+                // make memcpy
+                self.builder()
+                    .build_memcpy(
+                        field_address,
+                        8,
+                        field_value.into_pointer_value(),
+                        8,
+                        size,
+                    )
+                    .unwrap();
+            } else {
+                // otherwise just store it
+                self.builder()
+                    .build_store(
+                        field_address,
+                        field_value
+                    )
+                    .unwrap();
+            }
         }
         stct_mem.as_any_value_enum()
     }
@@ -705,14 +974,21 @@ impl<'c> Emmitter<'c> {
     /// Emmits machine code for an assignment.
     fn emmit_assignment(&'c self, assignment: &HIRAssignmentExpr) {
         let lhs = basic_value(self.emmit_expr_impl(&assignment.0.left_hand_side, true));
+        let value = basic_value(self.emmit_expr(&assignment.0.right_hand_side));
 
-        if let Some(aggr_ty) = &assignment.1 {
+        self.emmit_raw_assignment(
+            lhs,
+            value,
+            assignment.1.as_ref()
+        );
+    }
+
+    /// What does the ACTUAL assignment.
+    fn emmit_raw_assignment(&'c self, lhs: BasicValueEnum<'c>, value: BasicValueEnum<'c>, aggr: Option<&HIRType>) {
+        if let Some(aggr_ty) = aggr {
             // do memcpy if assigning to aggregate type
-            let value = basic_value(self.emmit_expr_impl(&assignment.0.right_hand_side, true));
             // get size of type
-            let size = self.llvm_type(&aggr_ty)
-                .size_of()
-                .unwrap();
+            let size = self.context().i64_type().const_int(aggr_ty.size() as u64, false);
             // make memcpy
             self.builder()
                 .build_memcpy(
@@ -725,9 +1001,8 @@ impl<'c> Emmitter<'c> {
                 .unwrap();
         } else {
             // else don't
-            let rhs = basic_value(self.emmit_expr_impl(&assignment.0.right_hand_side, false));
             self.builder()
-                .build_store(lhs.into_pointer_value(), rhs)
+                .build_store(lhs.into_pointer_value(), value)
                 .unwrap();
         }
     }
@@ -737,14 +1012,428 @@ impl<'c> Emmitter<'c> {
         let callee = self.emmit_expr(&call.callee);
         let mut params = vec![];
 
-        for param in call.params.iter() {
-            params.push(basic_value(self.emmit_expr(param)).into());
+        if let Some(aggr_ty) = call.returns_aggregate.as_ref() {
+            let output = self.builder()
+                .build_alloca(
+                    basic_type(self.llvm_type(aggr_ty)),
+                    ""
+                )
+                .unwrap();
+
+            params.push(output.into());
+
+            for param in call.params.iter() {
+                params.push(basic_value(self.emmit_expr(param)).into());
+            }
+    
+            self.builder()
+                .build_call(callee.into_function_value(), &params, "")
+                .unwrap();
+
+            output.into()
+        } else {
+            for param in call.params.iter() {
+                params.push(basic_value(self.emmit_expr(param)).into());
+            }
+    
+            self.builder()
+                .build_call(callee.into_function_value(), &params, "")
+                .unwrap()
+                .as_any_value_enum()
+        }
+    }
+
+    /// Emmits a `switch` instruction.
+    fn emmit_switch(&'c self, switch: &HIRSwitch) -> AnyValueEnum<'c> {
+        // get current block
+        let current_block = self.builder()
+            .get_insert_block()
+            .unwrap();
+        // append end block
+        let end_block = self.context()
+            .append_basic_block(current_block.get_parent().unwrap(), "switch: end block");
+        // set current block
+        self.builder()
+            .position_at_end(current_block);
+        // evaluate what to match
+        let matched_value = basic_value(self.emmit_expr_impl(&switch.value(), true));
+
+        let mut all_obtained = vec![];
+        // this is the block to jump to after a case
+        let mut next: BasicBlock;
+        // evaluate all cases
+        for case in switch.patterns() {
+            // emmit the case
+            if let Some(unmatched) = self.emmit_case(case, matched_value, end_block) {
+                all_obtained.push(unmatched);
+                next = unmatched;
+            } else {
+                break;
+            }
+            // set position to the unmatched block
+            self.builder()
+                .position_at_end(next);
         }
 
+        // remove any block which was not used
+        for obtained in all_obtained {
+            if obtained.get_first_instruction().is_none()
+            && obtained.get_first_use().is_none() {
+                obtained
+                    .remove_from_function()
+                    .unwrap();
+            }
+        }
+
+        // remove end block if it is ot used
+        if end_block.get_first_use().is_none() {
+            end_block.remove_from_function().unwrap();
+        }
+
+        self.const_null()
+    }
+
+    /// Emmits a single `case` instruction.
+    /// 
+    /// The `value` basic value is what to match.
+    /// The `end` basic block if the block after
+    /// the `switch` statement.
+    /// 
+    /// Returns the basic block for if the pattern
+    /// wasn't matched.
+    fn emmit_case(&'c self, case: &HIRCase, value: BasicValueEnum<'c>, end: BasicBlock<'c>) -> Option<BasicBlock<'c>> {
+        // push a new scope
+        self.push_scope(false, false);
+        // get the current block.
+        let EmmittedPattern { matched, unmatched } = self.emmit_pattern(case.pattern(), value);
+
+        // set the insert block
         self.builder()
-            .build_call(callee.into_function_value(), &params, "")
-            .unwrap()
-            .as_any_value_enum()
+            .position_at_end(matched);
+        // emmit the block of the case
+        self.emmit_block(case.block());
+        // if current block is not terminated go to
+        // end of match statement
+        self.if_not_finished(|builder| {
+            builder
+                .build_unconditional_branch(end)
+                .unwrap();
+        });
+        // pop the current scope
+        self.pop_scope();
+
+        // return the block to go to if this didn't match
+        unmatched
+    }
+
+    /// Emmits a pattern and returns the block where code will execute if
+    /// it is matched successfully. The `value` value is what to match with.
+    fn emmit_pattern(&'c self, pattern: &HIRPattern, value: BasicValueEnum<'c>) -> EmmittedPattern {
+        use HIRPattern as P;
+
+        // current block
+        let current_block = self.builder()
+            .get_insert_block()
+            .unwrap();
+        // this is where to go if it matched
+        let go_to_if_matched = self.context()
+            .append_basic_block(current_block.get_parent().unwrap(), "pattern: matched");
+
+        if let P::WildCard { ty, is_aggregate, name } = pattern {
+            // Here we have to put this name in scope
+            // this is always going to match
+            self.builder()
+                .build_unconditional_branch(go_to_if_matched)
+                .unwrap();
+            // set to the block
+            self.builder()
+                .position_at_end(go_to_if_matched);
+            // get the type for the allocation
+            let allocating_ty = basic_type(self.llvm_type(ty));
+            // allocate for the variable
+            let allocated_space = self.builder()
+                .build_alloca(allocating_ty, "")
+                .unwrap();
+            // set variable
+            self.set_var(name, allocated_space.as_any_value_enum());
+            // store value
+            self.emmit_raw_assignment(
+                allocated_space.as_basic_value_enum(),
+                value,
+                if *is_aggregate {
+                    Some(ty)
+                } else {
+                    None
+                }
+            );
+            EmmittedPattern {
+                matched: go_to_if_matched,
+                unmatched: None,
+            }
+        } else {
+            // this is where to go if it didn't match
+            let go_to_if_didnt_match = self.context()
+                .append_basic_block(current_block.get_parent().unwrap(), "pattern: unmatched");
+
+            match pattern {
+                P::Literal(literal_ty, literal) => {
+                    // check if is equal to literal
+                    let literal = basic_value(self.emmit_lit(literal));
+                    let jump = self.emmit_eq(literal_ty, value, literal);
+                    // build conditional jump
+                    self.builder()
+                        .build_conditional_branch(
+                            jump,
+                            go_to_if_matched,
+                            go_to_if_didnt_match
+                        )
+                        .unwrap();
+                }
+                P::Range { value_ty, begin, end } => {
+                    // get start and end literals
+                    let start = basic_value(self.emmit_lit(begin));
+                    let end = basic_value(self.emmit_lit(end));
+                    // check if it is between bounds
+                    let ge_to_start = self.emmit_ge(value_ty, value, start);
+                    let le_to_end = self.emmit_le(value_ty, value, end);
+                    // do an and
+                    let is_within_bounds = self.builder()
+                        .build_and(ge_to_start, le_to_end, "")
+                        .unwrap();
+                    // build conditional jump
+                    self.builder()
+                        .build_conditional_branch(
+                            is_within_bounds,
+                            go_to_if_matched,
+                            go_to_if_didnt_match
+                        )
+                        .unwrap();
+                }
+                P::DeStructure { structure, fields, is_union } => {
+                    if *is_union {
+                        // handling for unions
+                        let (_, _, field_pattern, field_ty) = fields.first().unwrap();
+                        // access the property inside the union
+                        let field_value = self.emmit_raw_union_access_property(
+                            value.into_pointer_value(),
+                            field_ty,
+                            false
+                        );
+                        // emmit the field
+                        let field_emmitted = self.emmit_pattern(
+                            field_pattern,
+                            field_value,
+                        );
+                        if let Some(unmatched) = field_emmitted.unmatched {
+                            // make the unmatched path of the subpath go to ours not matched
+                            self.builder()
+                                .position_at_end(unmatched);
+                            self.builder()
+                                .build_unconditional_branch(go_to_if_didnt_match)
+                                .unwrap();
+                        }
+                        // go to ours if did match
+                        self.builder()
+                            .position_at_end(field_emmitted.matched);
+                        self.builder()
+                            .build_unconditional_branch(go_to_if_matched)
+                            .unwrap();
+                    } else {
+                        // handling for structs
+                        // this one's a bit more complex
+                        let mut matched_next = None;
+                        let mut field_iter = fields.iter().peekable();
+                        while let Some((_, field_index, field_pattern, field_ty)) = field_iter.next() {
+                            // access the property inside the struct
+                            let field_value = self.emmit_raw_struct_access_property(
+                                value.into_pointer_value(),
+                                structure,
+                                *field_index as u32,
+                                field_ty,
+                                false
+                            );
+                            // emmit the field
+                            let field_emmitted = self.emmit_pattern(
+                                field_pattern,
+                                field_value,
+                            );
+                            if let Some(unmatched) = field_emmitted.unmatched {
+                                // make the unmatched path of the subpath go to ours not matched
+                                self.builder()
+                                    .position_at_end(unmatched);
+                                self.builder()
+                                    .build_unconditional_branch(go_to_if_didnt_match)
+                                    .unwrap();
+                            }
+                            if field_iter.len() == 1 {
+                                // go to ours if did match
+                                // and is last field matched
+                                self.builder()
+                                    .position_at_end(field_emmitted.matched);
+                                self.builder()
+                                    .build_unconditional_branch(go_to_if_matched)
+                                    .unwrap();
+                            } else {
+                                // if is not last create new basic block
+                                // and go there to continue checking for
+                                // other fields
+                                matched_next = Some(
+                                    self.context()
+                                        .append_basic_block(matched_next.unwrap_or(go_to_if_matched).get_parent().unwrap(), "")
+                                );
+                            }
+                        }
+                    }
+                }
+                P::WildCard { .. } => unreachable!(),
+            }
+            EmmittedPattern {
+                matched: go_to_if_matched,
+                unmatched: Some(go_to_if_didnt_match),
+            }
+        }
+    }
+
+    /// Checks for equality between two types.
+    fn emmit_eq(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
+        // TODO: Checking for equality is not implemented
+        todo!()
+    }
+
+    /// Checks for difference between two types.
+    fn emmit_ne(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
+        // TODO: Checking for difference is not implemented
+        todo!()
+    }
+
+    /// Checks for ordering (less than) between two types.
+    fn emmit_lt(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
+        // TODO: Checking for ordering (less than) is not implemented
+        todo!()
+    }
+
+    /// Checks for ordering (less than or equal) between two types.
+    fn emmit_le(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
+        // TODO: Checking for ordering (less than or equal) is not implemented
+        todo!()
+    }
+
+    /// Checks for ordering (greater than) between two types.
+    fn emmit_gt(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
+        // TODO: Checking for ordering (greater than) is not implemented
+        todo!()
+    }
+
+    /// Checks for ordering (greater than or equal) between two types.
+    fn emmit_ge(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
+        // TODO: Checking for ordering (greater than or equal) is not implemented
+        todo!()
+    }
+
+    fn emmit_raw_struct_access_property(
+        &'c self,
+        struct_value: PointerValue<'c>,
+        struct_ty: &HIRType,
+        mut property_index: u32,
+        property_ty: &HIRType,
+        take_lvalue: bool,
+    )  -> BasicValueEnum<'c> {
+        if let HIRType::AlignedStruct(struct_ty) = struct_ty {
+            property_index = index_aligned(
+                struct_ty.iter(),
+                property_index,
+            ) ;
+        } else {
+            panic!("Unaligned struct type found when accessing a property of a struct")
+        }
+        let struct_type = self.llvm_type(struct_ty);
+        let property_type = self.llvm_type(property_ty);
+
+        let address = self.builder()
+            .build_struct_gep(
+                basic_type(struct_type),
+                struct_value,
+                property_index,
+                ""
+            )
+            .unwrap();
+
+        if take_lvalue {
+            address.as_basic_value_enum()
+        } else {
+            if property_ty.is_aggr() {
+                let memory = self.builder()
+                    .build_alloca(
+                        basic_type(self.llvm_type(property_ty)),
+                        ""
+                    )
+                    .unwrap();
+                self.builder()
+                    .build_memcpy(
+                        memory,
+                        8,
+                        address,
+                        8,
+                        self.context()
+                            .i64_type()
+                            .const_int(property_ty.size() as u64, false)
+                    )
+                    .unwrap();
+                memory.as_basic_value_enum()
+            } else {
+                self.builder()
+                    .build_load(
+                        basic_type(property_type),
+                        address,
+                        ""
+                    )
+                    .unwrap()
+                    .as_basic_value_enum()
+            }
+        }
+    }
+
+    fn emmit_raw_union_access_property(
+        &'c self,
+        union_value: PointerValue<'c>,
+        property_ty: &HIRType,
+        take_lvalue: bool
+    ) -> BasicValueEnum<'c> {
+        let property_type = self.llvm_type(property_ty);
+
+        if take_lvalue {
+            union_value.as_basic_value_enum()
+        } else {
+            if property_ty.is_aggr() {
+                let memory = self.builder()
+                    .build_alloca(
+                        basic_type(self.llvm_type(property_ty)),
+                        ""
+                    )
+                    .unwrap();
+                self.builder()
+                    .build_memcpy(
+                        memory,
+                        8,
+                        union_value,
+                        8,
+                        self.context()
+                            .i64_type()
+                            .const_int(property_ty.size() as u64, false)
+                    )
+                    .unwrap();
+                memory.as_basic_value_enum()
+            } else {
+                self.builder()
+                .build_load(
+                    basic_type(property_type),
+                    union_value,
+                    ""
+                )
+                .unwrap()
+                .as_basic_value_enum()
+            }
+        }
     }
 
     /// Emmits a return instruction.
@@ -777,6 +1466,9 @@ impl<'c> Emmitter<'c> {
                     size,
                 )
                 .unwrap();
+
+            
+
             self.builder()
                 .build_return(Some(
                     &self.context().i32_type().const_int(0, false).as_basic_value_enum() as &dyn BasicValue<'c>
@@ -797,6 +1489,172 @@ impl<'c> Emmitter<'c> {
         }
     }
 
+    /// Emmits a literal as machine code.
+    fn emmit_cond(&'c self, cond: &HIRConditional) -> AnyValueEnum<'c> {
+        // do first things
+        let condition = self
+            .emmit_expr(&cond.condition)
+            .into_int_value();
+        let condition_block = self.builder()
+            .get_insert_block()
+            .unwrap();
+        let current_function = condition_block
+            .get_parent()
+            .unwrap();
+        let true_block = self.context()
+            .append_basic_block(
+                current_function,
+                ""
+            );
+        let false_or_end_block = self.context()
+            .append_basic_block(
+                current_function,
+                ""
+            );
+
+        // generate branch
+        self.builder()
+            .build_conditional_branch(
+                condition,
+                true_block,
+                false_or_end_block
+            )
+            .unwrap();
+
+        // build true block
+        {
+            // set insert block
+            self.builder()
+                .position_at_end(true_block);
+
+            self.push_scope(false, cond.else_part.is_some());
+
+            for expr in cond.then.stmts() {
+                self.emmit_expr(expr);
+            }
+
+            // jump to end if not finished
+            self.if_not_finished(
+                |builder| {
+                    builder
+                        .build_unconditional_branch(
+                            false_or_end_block
+                        )
+                        .unwrap();
+                }
+            );
+
+            self.pop_scope();
+        }
+
+        // build false block - or not
+        if let Some(false_block) = cond.else_part
+            .as_ref()
+            .map(|tuple| &tuple.1) {
+                // generate new end block
+                let end_block = self.context()
+                    .append_basic_block(
+                        current_function,
+                        ""
+                    );
+                // set insert block
+                self.builder()
+                    .position_at_end(false_or_end_block);
+
+                self.push_scope(false, true);
+
+                for expr in false_block.stmts() {
+                    self.emmit_expr(expr);
+                }
+
+                // jump to end if not finished
+                self.if_not_finished(
+                    |builder| {
+                        builder
+                            .build_unconditional_branch(end_block)
+                            .unwrap();
+                    }
+                );
+                    
+                self.builder()
+                    .position_at_end(end_block);
+    
+                self.pop_scope();
+            }
+
+        self.const_null()
+    }
+
+    
+    /// Emmits a literal as machine code.
+    fn emmit_while(&'c self, cond: &HIRWhileLoop) -> AnyValueEnum<'c> {
+        // get current function
+        let current_block = self.builder()
+            .get_insert_block()
+            .unwrap();
+        let current_function = current_block
+            .get_parent()
+            .unwrap();
+        // get blocks
+        let condition_block = self.context()
+            .append_basic_block(current_function, "");
+
+        let body_block = self.context()
+            .append_basic_block(current_function, "");
+
+        let after_block = self.context()
+            .append_basic_block(current_function, "");
+
+        // build condition
+        self.builder()
+            .position_at_end(condition_block);
+        let condition = self
+            .emmit_expr(&cond.condition)
+            .into_int_value();
+        
+        // build branch
+        self.builder()
+            .build_conditional_branch(
+                condition,
+                body_block,
+                after_block
+            )
+            .unwrap();
+
+        // build block
+        {
+            // set insert block
+            self.builder()
+                .position_at_end(body_block);
+
+            self.push_scope(false, false);
+
+            for expr in cond.block.stmts() {
+                self.emmit_expr(expr);
+            }
+
+            self.pop_scope();
+        }
+
+        self.const_null()
+    }
+
+    /// Applies the predicate to the last basic block if it was not
+    /// already finished (with a terminator instruction).
+    fn if_not_finished<F>(&'c self, predicate: F) -> Option<()>
+    where
+        F: FnOnce(&Builder<'c>) -> (),
+    {
+        let block = self.builder()
+            .get_insert_block()?;
+
+        if block.get_terminator().is_none() {
+            predicate(self.builder());
+        }
+
+        Some(())
+    }
+
     /// Builds a const null pointer.
     fn const_null(&'c self) -> AnyValueEnum<'c> {
         self.builder()
@@ -815,6 +1673,7 @@ impl<'c> Emmitter<'c> {
             .borrow_mut()
             .last_mut()
             .unwrap()
+            .variables
             .insert(s.to_string(), val);
     }
 
@@ -826,12 +1685,24 @@ impl<'c> Emmitter<'c> {
     /// Gets a variable from the list of scopes.
     fn get_var_opt(&'c self, s: &str) -> Option<AnyValueEnum<'c>> {
         for scope in self.scopes.borrow().iter() {
-            if let Some(val) = scope.get(s) {
+            if let Some(val) = scope.variables.get(s) {
                 return Some(*val);
             }
         }
 
         None
+    }
+
+    fn attribute_for_kind(&'c self, kind: AttributeKind) -> Attribute {
+        unsafe { Attribute::new(
+            LLVMCreateEnumAttribute(self.context().as_ctx_ref(), kind as u32, 1)
+        ) }
+    }
+
+    fn attribute_for_type(&'c self, kind: AttributeKind, ty: BasicTypeEnum<'c>) -> Attribute {
+        unsafe { Attribute::new(
+            LLVMCreateTypeAttribute(self.context().as_ctx_ref(), kind as u32, ty.as_type_ref())
+        ) }
     }
 
     fn builder(&'c self) -> &'c Builder<'c> {
@@ -853,4 +1724,33 @@ fn basic_type(an: AnyTypeEnum) -> BasicTypeEnum {
 /// Creates a basic value enum from an any value enum.
 fn basic_value(an: AnyValueEnum) -> BasicValueEnum {
     BasicValueEnum::try_from(an).unwrap()
+}
+
+/// Returns the actual index of a field within a struct
+/// accounting for padding and alignment.
+fn index_aligned<'a>(iter: impl Iterator<Item = &'a (HIRType, bool)>, index: u32) -> u32 {
+    let mut i = 0;
+    for (actual_idx, (_, is_alignment)) in iter.enumerate() {
+        if !*is_alignment {
+            if i == index {
+                return actual_idx as u32;
+            }
+            i += 1;
+        }
+    }
+
+    unreachable!()
+}
+
+/// Struct returned by the `emmit_pattern` function.
+/// 
+/// Contains the basic block to go to if pattern was
+/// matched and the one to go if it wasn't matched.
+pub struct EmmittedPattern<'c> {
+    /// Where you want to go if the pattern was
+    /// matched.
+    matched: BasicBlock<'c>,
+    /// Where you want to go if the pattern wasn't
+    /// matched.
+    unmatched: Option<BasicBlock<'c>>,
 }

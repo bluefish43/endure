@@ -13,7 +13,7 @@ AST are:
 
  */
 
-#[derive(Debug, new)]
+#[derive(Debug, new, Clone)]
 /// A declaration.
 ///
 /// A function declaration, a sum type
@@ -23,7 +23,7 @@ pub enum HIRDecl {
     FunctionDecl(HIRFunctionDecl),
 }
 
-#[derive(Debug, new)]
+#[derive(Debug, new, Clone)]
 /// Declaring a function within the
 /// local namespace.
 pub struct HIRFunctionDecl {
@@ -57,7 +57,7 @@ pub struct HIRArgument {
     pub ty: HIRType,
 }
 
-#[derive(Debug, new, Getters)]
+#[derive(Debug, new, Getters, Clone)]
 /// The block of the function.
 pub struct HIRBlock {
     /// The actual block contents.
@@ -79,14 +79,27 @@ pub mod expr {
     use derive_new::new;
 
     use crate::ast::{
-        expr::{BinaryOp, LiteralExpr}, Identifier, IntLit, Loc
+        expr::BinaryOp, IntLit, Loc
     };
+    
 
     pub type HIRIdentifier = String;
 
-    use super::{HIRBlock, HIRDecl, HIRPrototype, HIRType};
+    use super::{matcher::HIRSwitch, HIRBlock, HIRDecl, HIRPrototype, HIRType};
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
+    /// A literal value: a value which can
+    /// be represented as a single token, like
+    /// an integer, float, string, boolean or
+    /// others.
+    ///
+    /// Arrays are also included in this.
+    pub enum HIRLiteralExpr {
+        /// An integer literal.
+        Int(HIRType, IntLit),
+    }
+
+    #[derive(Debug, Clone)]
     /// A while loop.
     pub struct HIRWhileLoop {
         pub while_kw: Loc,
@@ -94,7 +107,7 @@ pub mod expr {
         pub block: HIRBlock,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// A conditional expression
     pub struct HIRConditional {
         pub if_kw: Loc,
@@ -103,12 +116,12 @@ pub mod expr {
         pub else_part: Option<(Loc, HIRBlock)>,
     }
 
-    #[derive(Debug, new)]
+    #[derive(Debug, new, Clone)]
     /// An expression which can be used
     /// as a value or not.
     pub enum HIRExpr {
         AsReference(HIRAsReferenceExpr),
-        Literal(LiteralExpr),
+        Literal(HIRLiteralExpr),
         Binary(HIRBinaryExpr),
         Assignment(HIRAssignmentExpr),
         SlotDecl(HIRIdentifier, HIRType),
@@ -121,9 +134,11 @@ pub mod expr {
             ty: HIRType,
             index: usize,
         },
+        /// A `switch` statement.
+        Switch(HIRSwitch),
         /// Gets the property at the specified index of the
         /// specified structural type at the specified index.
-        AccessProperty {
+        AccessStructProperty {
             /// The struct expression.
             struct_expr: Box<HIRExpr>,
             /// The struct type.
@@ -140,7 +155,24 @@ pub mod expr {
             /// 
             /// If we must load it first, it is equivalent to ->, otherwise
             /// it is equivalent to ".".
-            must_dereference_struct: bool,
+            must_dereference_first: bool,
+        },
+        /// Gets the property at the specified index of the specified
+        /// union type.
+        AccessUnionProperty {
+            /// The union expression.
+            union_expr: Box<HIRExpr>,
+            /// The type of the property.
+            property_ty: HIRType,
+            /// If the compiler must load the struct before accessing
+            /// its property (in case for a pointer to union type)
+            /// 
+            /// Note: As we don't have a special -> operator, we use
+            /// this to indicate whether one or another should be used.
+            /// 
+            /// If we must load it first, it is equivalent to ->, otherwise
+            /// it is equivalent to ".".
+            must_dereference_first: bool,
         },
         /// The use of a global function as a symbol.
         ///
@@ -152,18 +184,35 @@ pub mod expr {
         Return(HIRReturnExpr),
         Conditional(HIRConditional),
         WhileLoop(HIRWhileLoop),
-        /// Defines this before evaluating the following expression.
-        DefineAndEval(HIRDecl, Box<HIRExpr>),
         /// The instantiation of a struct.
         /// 
-        /// We have here the type of the struct and the types of
-        /// its fields.
-        InstantiateStruct(HIRType, Vec<HIRExpr>),
+        /// We have here the type of the struct and the values of
+        /// its fields with options indicating if they are aggregate
+        /// or if they are not. If they are, they're memcpy-ed inside
+        /// of the struct instead.
+        InstantiateStruct(HIRType, Vec<(HIRExpr, Option<HIRType>)>),
+        /// The instantiation of a union.
+        /// 
+        /// We have here the type of the union, the type and the
+        /// value of the field we're assigning to and if the
+        /// type we're assigning is aggregate or not along with the
+        /// type if it is.
+        InstantiateUnion(HIRType, Box<HIRExpr>, Option<HIRType>),
         /// Dereferences a pointer.
         Dereference(HIRType, Box<HIRExpr>),
+
+        // -- these aren't really expressions,
+        //    but rather helpers
+
+        /// Defines this before evaluating the following expression.
+        DefineAndEval(HIRDecl, Box<HIRExpr>),
+        /// A sequence of other expressions.
+        Sequence(Vec<HIRExpr>),
+        /// Executed at the end of the scope.
+        Defer(Box<HIRExpr>),
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// A special type of expression in which,
     /// if available, returns an lvalue instead
     /// of an rvalue.
@@ -200,10 +249,10 @@ pub mod expr {
     /// This also contains a flag indicating if we're
     /// assigning to an aggregate type or not and if we
     /// are, the aggregate type we're assigning.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub struct HIRAssignmentExpr(pub HIRBinaryExpr, pub Option<HIRType>);
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// The type of binary operation.
     pub enum BinOpType {
         /// An integer operation.
@@ -214,7 +263,7 @@ pub mod expr {
         Float,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// A binary expression is formed by the
     /// left hand side (the left side of the
     /// binary operator), the binary operator
@@ -237,7 +286,7 @@ pub mod expr {
         pub op_ty: BinOpType,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     /// The returning of a value.
     pub struct HIRReturnExpr {
         pub ret_kw: Loc,
@@ -245,17 +294,17 @@ pub mod expr {
         pub aggregate: Option<HIRType>,
     }
 
-    #[derive(Debug, new)]
+    #[derive(Debug, new, Clone)]
     /// A function call.
     pub struct HIRCallExpr {
         /// What we're calling.
         pub callee: Box<HIRExpr>,
         /// The parameters used in the call..
         pub params: Vec<HIRExpr>,
+        /// If this returns an aggregate type.
+        pub returns_aggregate: Option<HIRType>,
     }
 }
-
-use std::collections::HashSet;
 
 use derive_getters::Getters;
 use derive_new::new;
@@ -273,9 +322,9 @@ pub mod typing {
 
     use derive_new::new;
 
-    use crate::ast::{typing::PrimType, IntLit};
+    use crate::ast::{typing::{PrimType, TypeBits}, IntLit};
 
-    use super::{HIRIdentifier, HIRPrototype, Loc};
+    use super::{HIRPrototype, Loc};
 
     /*
 
@@ -323,6 +372,13 @@ pub mod typing {
         },
         /// A structural type and its fields.
         Struct(Vec<HIRType>),
+        /// A sorted struct type (with alignment).
+        /// 
+        /// For each field, has a flag if it is data
+        /// (false) or alignment (true).
+        AlignedStruct(Vec<(HIRType, bool)>),
+        /// An union type.
+        Union(Vec<HIRType>),
         /// A pointer to a function.
         FunctionPointer(HIRPrototype),
         /// The void     type.
@@ -342,24 +398,194 @@ pub mod typing {
                 _ => false,
             }
         }
-    }
 
-    // TODO: Move this within the context so we can
-    //       make sure that types with the same name
-    //       but in different namespaces are treated
-    //       differently.
-    impl PartialEq for HIRType {
-        fn eq(&self, other: &Self) -> bool {
-            match (self, other) {
-                (Self::Universe, _) => true,
-                (_, Self::Universe) => true,
-                (Self::Primitive { ty, .. }, Self::Primitive { ty: ty2, .. }) => ty == ty2,
-                (Self::Void, Self::Void) => true,
-                (Self::Pointer { pointee, mutability }, Self::Pointer { pointee: pointee2, mutability: mutability2 }) => pointee == pointee2 && mutability.is_some() == mutability2.is_some(),
-                _ => false,
+        /// Gets the size of this type.
+        pub fn size(&self) -> usize {
+            match self {
+                Self::Primitive { loc, ty } => {
+                    ty.size()
+                }
+                Self::Universe
+                | Self::Void => panic!("Obtaining size of illegal type"),
+                Self::SizedArray { size, element_type } => {
+                    element_type.size() * size.1 as usize
+                }
+                Self::FunctionPointer(_) => 8,
+                Self::Union(u) => {
+                    u.iter()
+                        .map(|field| field.size())
+                        .max()
+                        .expect("No fields in union")
+                }
+                Self::Struct(_) => {
+                    panic!("Obtaining size of illegal type (unaligned struct)")
+                }
+                Self::AlignedStruct(al) => {
+                    al.iter()
+                        .map(|field| field.0.size())
+                        .sum()
+                }
+                Self::Pointer { pointee, mutability } => std::mem::size_of::<usize>(),
+            }
+        }
+
+        pub fn is_aggr(&self) -> bool {
+            matches!(
+                self,
+                Self::AlignedStruct(_)
+                | Self::Union(_)
+            )
+        }
+
+        /// Adds proper padding and alignment to this
+        /// struct to ensure X-bytes alignment.
+        pub fn into_aligned(self, align: usize) -> HIRType {
+            if let HIRType::Struct(mut fields) = self {
+                let mut aligned_fields = vec![];
+                let padding_types = [(8, TypeBits::B64), (4, TypeBits::B32), (2, TypeBits::B16), (1, TypeBits::B8)];
+
+                // Sort fields by size in descending order
+                fields.sort_by_key(|f| f.size());
+
+                let mut current_offset = 0;
+
+                for field in fields {
+                    let field_size = field.size();
+
+                    // Calculate padding needed for this field's alignment
+                    let padding_size = (field_size - (current_offset % field_size)) % field_size;
+
+                    // Add padding using the smallest types
+                    let mut remaining_padding = padding_size;
+                    for &(size, type_bits) in &padding_types {
+                        while remaining_padding >= size {
+                            aligned_fields.push((
+                                HIRType::Primitive {
+                                    loc: Loc::default(),
+                                    ty: PrimType::UInt(type_bits),
+                                },
+                                true,
+                            ));
+                            remaining_padding -= size;
+                            current_offset += size;
+                        }
+                    }
+
+                    // Add the field
+                    aligned_fields.push((field, false));
+                    current_offset += field_size;
+                }
+
+                // Calculate and add final padding to ensure overall alignment
+                let final_padding_size = (align - (current_offset % align)) % align;
+                if final_padding_size > 0 {
+                    let mut remaining_padding = final_padding_size;
+                    for &(size, type_bits) in &padding_types {
+                        while remaining_padding >= size {
+                            aligned_fields.push((
+                                HIRType::Primitive {
+                                    loc: Loc::default(),
+                                    ty: PrimType::UInt(type_bits),
+                                },
+                                true,
+                            ));
+                            remaining_padding -= size;
+                        }
+                    }
+                }
+
+                HIRType::AlignedStruct(aligned_fields)
+            } else {
+                unreachable!("Called into_aligned() with non-struct type")
             }
         }
     }
 }
+
+pub mod matcher {
+    /*!
+    
+    # The `matcher` module
+
+    This module includes everything (or almost everything)
+    related to the support of pattern matching within
+    endure.
+
+    We here have the switch statement itself, the match arms
+    and the patterns.
+
+    */
+
+    use self::expr::HIRLiteralExpr;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Getters, new)]
+    /// A `switch` statement.
+    pub struct HIRSwitch {
+        /// What to switch on.
+        value: Box<HIRExpr>,
+        /// All of the specified patterns with
+        /// their cases.
+        patterns: Vec<HIRCase>,
+    }
+
+    #[derive(Debug, Clone, Getters, new)]
+    /// A single `case` in the `switch`.
+    pub struct HIRCase {
+        /// The pattern which we are applying.
+        pattern: HIRPattern,
+        /// The block to be executed if the
+        /// pattern matches.
+        block: HIRBlock,
+    }
+
+    #[derive(Debug, Clone, new)]
+    /// A pattern to be matched.
+    /// 
+    /// TODO:
+    /// List patterns, struct destructuring,
+    /// guards in case statements
+    pub enum HIRPattern {
+        /// A literal to be matched.
+        Literal(HIRType, HIRLiteralExpr),
+        /// An inclusive range between two
+        /// integers.
+        /// 
+        /// Exclusive ranges have already been
+        /// inlined to inclusive ranges at
+        /// this time.
+        Range {
+            /// This is the type of the value.
+            value_ty: HIRType,
+            /// Where this range begins.
+            begin: HIRLiteralExpr,
+            /// Where this range ends (n - 1).
+            end: HIRLiteralExpr,
+        },
+        /// Destructure a structure with
+        /// its fields.
+        DeStructure {
+            /// The structure we're destructuring.
+            structure: HIRType,
+            /// If this is an union instead of a struct.
+            is_union: bool,
+            /// The fields themselves which
+            /// were matched, indexes and types.
+            /// 
+            /// If no pattern is specified then
+            /// the pattern is the field name
+            /// itself.
+            fields: Vec<(String, usize, HIRPattern, HIRType)>,
+        },
+        /// Matches anything.
+        WildCard {
+            ty: HIRType,
+            is_aggregate: bool,
+            name: String
+        },
+    }
+}
+
 
 pub type HighLevelIR = HIRDecl;

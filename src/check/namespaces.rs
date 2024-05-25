@@ -3,14 +3,14 @@
 //! their resolution.
 //!
 use std::{
-    cell::{Ref, RefCell},
+    cell::RefCell,
     collections::HashMap,
     rc::{Rc, Weak},
 };
 
 use crate::ast::{tdecl::UserType, typing::NameIndex, Collection};
 
-use super::{ActCtxUserType, ActFunction, ActGenericFunction, CtxUserType, Function};
+use super::{ActCtxUserType, ActFunction, ActGenericFunction, CtxUserType};
 
 /// The children of an already existing namespace.
 pub type NamespaceChildren = HashMap<NameIndex, ActNamespace>;

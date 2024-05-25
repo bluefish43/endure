@@ -177,12 +177,12 @@ impl Scopes {
     }
 
     /// Searches for a variable inside of the scopes.
-    pub fn search_for_variable(&self, name: &NameIndex) -> Option<&Variable> {
+    pub fn search_for_variable(&self, name: &NameIndex) -> Option<(&Variable, usize)> {
         // search into all frames for the variable
-        for scope in self.scopes.iter().rev() {
+        for (index, scope) in self.scopes.iter().enumerate().rev() {
             match scope.search_for_variable(name) {
                 // return the variable if found
-                Some(var) => return Some(var),
+                Some(var) => return Some((var, index)),
                 None if scope.function.is_some() => {
                     // if the current scope is a function,
                     // stop the search
@@ -200,13 +200,13 @@ impl Scopes {
     }
 
     /// Searches for a variable inside of the scopes.
-    pub fn search_for_variable_mut(&mut self, name: &NameIndex) -> Option<&mut Variable> {
+    pub fn search_for_variable_mut(&mut self, name: &NameIndex) -> Option<(&mut Variable, usize)> {
         // search into all frames for the variable
-        for scope in self.scopes.iter_mut().rev() {
+        for (index, scope) in self.scopes.iter_mut().enumerate().rev() {
             let is_function_scope = scope.function.is_some();
             match scope.search_for_variable_mut(name) {
                 // return the variable if found
-                Some(var) => return Some(var),
+                Some(var) => return Some((var, index)),
                 None if is_function_scope => {
                     // if the current scope is a function,
                     // stop the search

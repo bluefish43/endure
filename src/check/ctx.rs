@@ -10,16 +10,16 @@ the implementation and separate concerns.
 
  */
 
-use std::{cell::RefCell, collections::HashMap, rc::{Rc, Weak}};
+use std::{collections::HashMap, rc::{Rc, Weak}};
 
 use either::Either;
 
 use crate::ast::{
-    expr::BinaryOp, tdecl::UserType, typing::{NameIndex, PrimType, Type}, Argument, Collection, FunctionDecl, Identifier, Loc, Prototype
+    expr::BinaryOp, tdecl::UserType, typing::{NameIndex, PrimType, Type}, Argument, Collection, FunctionDecl, Loc, Prototype, Receiver
 };
 
 use super::{
-    namespaces::*, scopes::{Scope, Scopes, Variable}, ActCtxUserType, ActFunction, CheckerError, CtxUserType, Function, GenericFunction, RequiredState
+    namespaces::*, scopes::{Scope, Scopes, Variable}, ActFunction, CheckerError, CtxUserType, Function, GenericFunction, RequiredState,
 };
 
 const SAFE_SCOPE: bool = false;
@@ -99,12 +99,12 @@ impl Context {
     }
 
     /// Lookups for a variable inside of this context.
-    pub fn lookup_variable(&self, name: &NameIndex) -> Option<&Variable> {
+    pub fn lookup_variable(&self, name: &NameIndex) -> Option<(&Variable, usize)> {
         self.call_stack.search_for_variable(name)
     }
 
     /// Lookups for a variable inside of this context.
-    pub fn lookup_variable_mut(&mut self, name: &NameIndex) -> Option<&mut Variable> {
+    pub fn lookup_variable_mut(&mut self, name: &NameIndex) -> Option<(&mut Variable, usize)> {
         self.call_stack.search_for_variable_mut(name)
     }
 
@@ -114,7 +114,7 @@ impl Context {
     pub fn lookup_any(&self, name: &NameIndex) -> Option<SearchItem> {
         if let Some(var) = self
             .lookup_variable(name)
-            .map(|var| SearchItem::Variable(var))
+            .map(|var| SearchItem::Variable(var.0, var.1))
         {
             Some(var)
         } else {
@@ -134,7 +134,7 @@ impl Context {
     /// # Panics
     /// This function panics if the current
     /// function is `None`.
-    pub fn add_function_scope(&mut self, arguments: &[Argument], unsafety: bool) {
+    pub fn add_function_scope(&mut self, receiver: Option<&Receiver>, arguments: &[Argument], unsafety: bool) {
         // push the scope
         self.call_stack.push_scope(
             Some(
@@ -145,13 +145,26 @@ impl Context {
             unsafety,
         );
 
+        let mut offset = 0;
+
+        if let Some(receiver) = receiver {
+            self.insert_variable_in_last_scope(
+                receiver.receiver_name().index(),
+                (**receiver.ty()).clone(),
+                Some(0),
+                None,
+                true,
+            );
+            offset = 1;
+        }
+
         // add the arguments to last scope
         for (index, argument) in arguments.iter().enumerate() {
             self.insert_variable_in_last_scope(
                 argument.name.index(),
                 argument.ty.clone(),
                 // true because this is an argument
-                Some(index),
+                Some(index + offset),
                 argument.mutability.clone(),
                 true,
             );
@@ -448,8 +461,9 @@ impl Context {
 /// May be a reference to a variable
 /// or a member of a namespace.
 pub enum SearchItem<'a> {
-    /// A variable which was found.
-    Variable(&'a Variable),
+    /// A variable which was found
+    /// and the index of its scope.
+    Variable(&'a Variable, usize),
     /// A member of a namespace.
     Member(Member),
 }

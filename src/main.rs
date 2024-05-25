@@ -1,210 +1,234 @@
-use std::process::ExitCode;
+#![allow(dead_code)]
+
+use std::{process::ExitCode, time::Duration};
 
 use ansi_term::Color;
 use ast::{
     expr::{
         AsReferenceExpr, AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Expr, LiteralExpr,
         ReturnExpr,
-    }, generics::{Generic, Generics}, tdecl::{TypeDecl, UserType}, typing::{PrimType, Type, TypeBits}, Argument, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, NamespaceDecl, Prototype
+    }, generics::{Generic, Generics}, matcher::{Case, Pattern, Switch}, tdecl::{Struct, TypeDecl, UserType}, typing::{PrimType, Type, TypeBits}, Argument, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, NamespaceDecl, Prototype, Receiver
 };
 use check::Checker;
+use commands::args::{Solution, Task};
+use either::Either;
 use inkwell::{context::Context, targets::CodeModel, OptimizationLevel};
 
 use crate::codegen::{Emmitter, ExportFormat, ExportOptions};
 
 mod ast;
 mod check;
+mod commands;
 mod codegen;
 
-fn main() -> ExitCode {
-    let mut collection = Collection::new();
-    let set_value_name = collection.add("set_value".to_string());
-    let main_name = collection.add("main".to_string());
-    let other_func_name = collection.add("other_func".to_string());
-    let my_param_name = collection.add("my_param".to_string());
-    let my_param2_name = collection.add("my_param2".to_string());
-    let my_slot_name = collection.add("my_slot".to_string());
-    let my_field_name = collection.add("my_field".to_string());
-    let my_field2_name = collection.add("my_field2".to_string());
-    let my_namespace_name = collection.add("mynamespace".to_string());
-    let my_struct_name = collection.add("MyStruct".to_string());
-    let t_name = collection.add("T".to_string());
-    let loc = Loc::new(0, 0, 0);
-    let global = &[Decl::NamespaceDecl(NamespaceDecl::new(
-        loc.clone(),
-        Identifier(loc.clone(), my_namespace_name),
-        loc.clone(),
-        vec![
-            Decl::TypeDecl(TypeDecl::new(
-                loc.clone(),
-                Identifier(
-                    loc.clone(),
-                    my_struct_name,
-                ),
-                loc.clone(),
-                UserType::Struct {
-                    fields: vec![
-                        (
-                            Identifier(
-                                loc.clone(),
-                                my_field_name,
-                            ),
-                            Type::new_primitive(
-                                loc.clone(),
-                                PrimType::Int(TypeBits::B64),
-                            )
-                        ),
-                        (
-                            Identifier(
-                                loc.clone(),
-                                my_field2_name,
-                            ),
-                            Type::new_primitive(
-                                loc.clone(),
-                                PrimType::Int(TypeBits::B64),
-                            )
-                        )
-                    ]
-                }
-            )),
-            Decl::FunctionDecl(FunctionDecl::new(
-                vec![],
-                loc.clone(),
-                Prototype::new(
-                    Identifier(loc.clone(), set_value_name),
-                    loc.clone(),
-                    vec![
-                        Argument::new(
-                            Identifier(
-                                loc.clone(),
-                                my_param_name,
-                            ),
-                            Type::new_pointer(
-                                Box::new(Type::new_named_type(Identifier(
-                                    loc.clone(),
-                                    t_name,
-                                ))),
-                                None,
-                            ),
-                            None,
-                        ),
-                        Argument::new(
-                            Identifier(
-                                loc.clone(),
-                                my_param2_name,
-                            ),
-                            Type::new_named_type(Identifier(
-                                loc.clone(),
-                                t_name,
-                            )),
-                            None,
-                        )
-                    ],
-                    loc.clone(),
-                    Some(Generics {
-                        lbrac: loc.clone(),
-                        generics: vec![
-                            Generic {
-                                name: Identifier(loc.clone(), t_name),
-                            }
-                        ],
-                        rbrac: loc.clone(),
-                    }),
-                    Box::new(Type::new_primitive(
-                        loc.clone(),
-                        PrimType::Int(TypeBits::B64),
-                    )),
-                    true,
-                ),
-                Block::new(
-                    loc.clone(),
-                    vec![
-                        Expr::Assignment(AssignmentExpr(BinaryExpr {
-                            left_hand_side: Box::new(Expr::AsReference(AsReferenceExpr(
-                                loc.clone(),
-                                Box::new(Expr::AccessProperty(
-                                    Box::new(Expr::Variable(Identifier(loc.clone(), my_param_name))),
-                                    loc.clone(),
-                                    Identifier(loc.clone(), my_field_name),
-                                )),
-                            ))),
-                            op: (loc.clone(), BinaryOp::Plus),
-                            right_hand_side: Box::new(Expr::Literal(LiteralExpr::Int(
-                                IntLit(loc.clone(), 420),
-                            ))),
-                        })),
-                        Expr::Return(ReturnExpr {
-                            ret_kw: loc.clone(),
-                            expr: Some(Box::new(Expr::Literal(LiteralExpr::Int(
-                                IntLit(loc.clone(), 0),
-                            )))),
-                        }),
-                    ],
-                    loc.clone(),
-                ),
-            )),
-            Decl::FunctionDecl(FunctionDecl::new(
-                vec![],
-                loc.clone(),
-                Prototype::new(
-                    Identifier(loc.clone(), main_name),
-                    loc.clone(),
-                    vec![],
-                    loc.clone(),
-                    None,
-                    // Box::new(Type::new_primitive(
-                    //     loc.clone(),
-                    //     PrimType::Int(TypeBits::B64),
-                    // )),
-                    Box::new(Type::new_named_type(
-                        Identifier(
-                            loc.clone(),
-                            my_struct_name,
-                        ),
-                    )),
-                    true,
-                ),
-                Block::new(
-                    loc.clone(),
-                    vec![
-                        Expr::SlotDecl {
-                            mutability: None,
-                            name: Identifier(loc.clone(), my_slot_name),
-                            ty: Type::new_named_type(Identifier(loc.clone(), my_struct_name)),
-                        },
-                        Expr::Assignment(AssignmentExpr(BinaryExpr {
-                            left_hand_side: Box::new(Expr::AsReference(AsReferenceExpr(
-                                loc.clone(),
-                                Box::new(Expr::Variable(Identifier(loc.clone(), my_slot_name))),
-                            ))),
-                            op: (loc.clone(), BinaryOp::Plus),
-                            right_hand_side: Box::new(Expr::InstantiateStruct(
-                                Identifier(loc.clone(), my_struct_name),
-                                vec![
-                                    (Identifier(loc.clone(), my_field_name), Expr::Literal(LiteralExpr::Int(
-                                        IntLit(loc.clone(), 420),
-                                    ))),
-                                    (Identifier(loc.clone(), my_field2_name), Expr::Literal(LiteralExpr::Int(
-                                        IntLit(loc.clone(), 69),
-                                    )))
-                                ]
-                            ))
-                        })),
-                        Expr::Return(ReturnExpr {
-                            ret_kw: loc.clone(),
-                            expr: Some(Box::new(Expr::Variable(Identifier(loc.clone(), my_slot_name)))),
-                        }),
-                    ],
-                    loc.clone(),
-                ),
-            )),
-        ],
-        loc.clone(),
-    ))];
-    let mut checker = Checker::new(collection);
-    checker.collect(global);
+fn report_start() {
+    eprintln!();
+}
 
-    let hir_decls = checker.pass_program(global);
+fn report_state(state: &'static str) {
+    eprint!("\r{state}");
+}
+
+fn report_finish(message: &'static str) {
+    eprintln!("\n{message}");
+}
+
+macro_rules! tip {
+    ($($arg:tt)*) => {{
+        eprintln!($($arg)*, tip = blue!("Tip"));
+    }};
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    // let solution = match Solution::from_args() {
+    //     Ok(solution) => solution,
+    //     Err(error) => {
+    //         eprintln!(
+    //             "{error_str}: {error}",
+    //             error_str = red!("Error"),
+    //         );
+    //         tip!("{tip}: Use the command '{help}'", help = green!("help"));
+
+    //         return ExitCode::FAILURE;
+    //     }
+    // };
+
+    // match solution.task() {
+    //     Task::Help => {
+    //         commands::help::help_command().unwrap();
+    //     }
+    //     Task::Build(_) => {
+    //         todo!("Building input file")
+    //     }
+    // }
+
+    // ExitCode::SUCCESS
+    let mut collection = Collection::new();
+    let file_name = collection.add("main.ed".to_string());
+    let main_name = collection.add("main".to_string());
+    let unaligned_field_name = collection.add("unaligned_field".to_string());
+    let field_name = collection.add("field".to_string());
+    let param_name = collection.add("param".to_string());
+    let var_name = collection.add("var".to_string());
+    let my_struct_name = collection.add("MyStruct".to_string());
+    let my_union_name = collection.add("MyUnion".to_string());
+    let loc = Loc::new(
+        file_name,
+        1,
+        1
+    );
+    let i64_ty = Type::Primitive {
+        loc,
+        ty: PrimType::Int(TypeBits::B64)
+    };
+    let i8_ty = Type::Primitive {
+        loc,
+        ty: PrimType::Int(TypeBits::B8)
+    };
+    let my_struct_ty = Type::NamedType(Identifier(loc, my_struct_name));
+    let my_union_ty = Type::NamedType(Identifier(loc, my_union_name));
+
+    let mut global = vec![
+        Decl::new_type_decl(TypeDecl::new(
+            loc,
+            Identifier(loc, my_struct_name),
+            loc,
+            UserType::Struct(
+                Struct::new(
+                    vec![
+                        (Identifier(loc, unaligned_field_name), i8_ty.clone()),
+                        (Identifier(loc, field_name), i64_ty.clone()),
+                    ]
+                )
+            )
+        )),
+        Decl::new_type_decl(TypeDecl::new(
+            loc,
+            Identifier(loc, my_union_name),
+            loc,
+            UserType::Union(
+                vec![
+                    (Identifier(loc, unaligned_field_name), i8_ty.clone()),
+                    (Identifier(loc, field_name), my_struct_ty.clone()),
+                ]
+            )
+        )),
+        Decl::new_function_decl(FunctionDecl::new(
+            vec![],
+            loc,
+            Prototype::new(
+                None,
+                Identifier(loc, main_name),
+                loc,
+                vec![
+                    Argument::new(
+                        Identifier(loc, param_name),
+                        my_struct_ty.clone(),
+                        None
+                    )
+                ],
+                loc,
+                None,
+                // Box::new(Type::Pointer {
+                //     pointee: Box::new(
+                //         my_union_ty.clone()
+                //     ),
+                //     mutability: None,
+                //     lifetime: None,
+                // }),
+                Box::new(my_struct_ty.clone()),
+                false
+            ),
+            Block::new(
+                loc,
+                vec![
+                    Expr::SlotDecl {
+                        mutability: None,
+                        name: Identifier(loc, var_name),
+                        ty: Type::NamedType(Identifier(loc, my_union_name)),
+                    },
+                    Expr::Assignment(AssignmentExpr(BinaryExpr {
+                        left_hand_side: Box::new(
+                            Expr::AsReference(AsReferenceExpr(loc, Box::new(
+                                Expr::Variable(Identifier(loc, var_name))
+                            )))
+                        ),
+                        op: (loc, BinaryOp::Plus),
+                        right_hand_side: Either::Left(
+                            Box::new(
+                                Expr::InstantiateStruct(
+                                    Identifier(loc, my_union_name),
+                                    vec![
+                                        (Identifier(loc, field_name), Expr::Variable(Identifier(loc, param_name)))
+                                    ]
+                                )
+                            )
+                        )
+                    })),
+                    Expr::Switch(Switch {
+                        switch_tok: loc,
+                        value: Box::new(
+                            Expr::Variable(Identifier(loc, var_name)),
+                        ),
+                        rkey_tok: loc,
+                        lkey_tok: loc,
+                        patterns: vec![
+                            Case::new(
+                                loc,
+                                Pattern::DeStructure {
+                                    name: Identifier(loc, my_union_name),
+                                    lkey_tok: loc,
+                                    fields: vec![
+                                        (
+                                            None,
+                                            Identifier(loc, field_name),
+                                            None,
+                                        ),
+                                    ],
+                                    ignore: None,
+                                    rkey_tok: loc,
+                                },
+                                Block::new(
+                                    loc,
+                                    vec![
+                                        Expr::Return(ReturnExpr {
+                                            ret_kw: loc,
+                                            expr: Some(Box::new(
+                                                Expr::Variable(
+                                                    Identifier(loc, field_name)
+                                                )
+                                            ))
+                                        })
+                                    ],
+                                    loc,
+                                ),
+                            )
+                        ]
+                    }),
+                    // Expr::Return(ReturnExpr {
+                    //     ret_kw: loc,
+                    //     expr: Some(Box::new(
+                    //         Expr::AsReference(
+                    //             AsReferenceExpr(
+                    //                 loc,
+                    //                 Box::new(Expr::Variable(
+                    //                     Identifier(loc, var_name)
+                    //                 ))
+                    //             )
+                    //         )
+                    //     ))
+                    // }),
+                ],
+                loc
+            )
+        ))
+    ];
+
+    let mut checker = Checker::new(collection);
+    checker.collect(&global);
+
+    let hir_decls = checker.pass_program(&global);
 
     let errors = checker.errors();
     let warnings = checker.warnings();
@@ -216,6 +240,8 @@ fn main() -> ExitCode {
         eprintln!("{}", warning.to_string(checker.collection(), true))
     }
     if !errors.is_empty() {
+        
+        eprint!("\r");
         // fail if any error occurred
         eprintln!(
             "Compilation {} with {} error{} and {} warning{}",
@@ -229,30 +255,32 @@ fn main() -> ExitCode {
         ExitCode::FAILURE
     } else {
         // okay otherwise
+        report_state("Generating IR...          ");
+        std::thread::sleep(Duration::from_millis(500));
 
         let context = Context::create();
 
         let generator;
 
         unsafe {
-            generator = Box::leak(Box::new(Emmitter::new(&context, "main"))) as *mut Emmitter;
+            generator = Box::leak(Box::new(Emmitter::new(&context, "main", ExportOptions {
+                format: ExportFormat::LLVMIR,
+                output: "./a.out".to_string(),
+                optimization_level: OptimizationLevel::Default,
+                use_pie: false,
+                code_model: CodeModel::Medium,
+                triple: None,
+            }))) as *mut Emmitter;
             let reference = generator.as_mut().unwrap();
             reference.emmit_program(&hir_decls.as_slice());
-            reference.dump();
 
-            match reference.export(
-                &ExportOptions {
-                    format: ExportFormat::LLVMIR,
-                    output: "./a.out",
-                    optimization_level: OptimizationLevel::Default,
-                    use_pie: false,
-                    code_model: CodeModel::Medium,
-                    triple: None,
-                }
-            ) {
+            report_state("Generating output file... ");
+            std::thread::sleep(Duration::from_millis(500));
+
+            match reference.export() {
                 Ok(_) => {
                     eprintln!(
-                        "Compilation {} with {} error{} and {} warning{}",
+                        "\rCompilation {} with {} error{} and {} warning{}",
                         Color::Green.bold().paint("SUCCESS"),
                         errors.len(),
                         if errors.len() == 1 { "" } else { "s" },
@@ -262,7 +290,7 @@ fn main() -> ExitCode {
                 },
                 Err(err) => {
                     eprintln!(
-                        "Compilation {} when exporting: {err}",
+                        "\rCompilation {} when exporting: {err}",
                         Color::Red.bold().paint("FAILURE")
                     )
                 }

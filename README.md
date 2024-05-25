@@ -10,9 +10,10 @@ In type checking and AST
 - [x] Declaration of functions;
 - [x] Declaration of namespaces;
 - [x] Search of elements within the current namespace;
+- [x] Generic functions (templates);
 - [ ] Use of elements from outer namespaces; and
 - [ ] Importing namespaces from an include path.
 
 And for a more general look:
 
-- [ ] Implement code generation with LLVM.
+- [x] Implement code generation with LLVM.

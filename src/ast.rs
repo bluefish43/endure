@@ -88,7 +88,7 @@ impl Collection {
     }
 }
 
-#[derive(new, Debug, Clone, PartialEq, Getters, Default)]
+#[derive(new, Debug, Clone, PartialEq, Getters, Default, Copy)]
 /// The location of something inside
 /// of a file.
 pub struct Loc {
@@ -121,7 +121,19 @@ impl Identifier {
 
 #[derive(Debug, Clone)]
 /// An integer literal.
-pub struct IntLit(pub Loc, pub i128);
+/// 
+/// Contains a sign for if this is negative.
+pub struct IntLit(pub Loc, pub bool, pub u64);
+
+impl Into<i128> for IntLit {
+    fn into(self) -> i128 {
+        if self.1 {
+            -(self.2 as i128)
+        } else {
+            self.2 as i128
+        }
+    }
+}
 
 /// An attribute applied to anything.
 pub enum Attribute {
@@ -201,6 +213,8 @@ impl FunctionDecl {
 /// The prototype of the function, including its signature
 /// (ins and outs), name and return type.
 pub struct Prototype {
+    /// The receiver of the function.
+    pub receiver: Option<Receiver>,
     /// The name of the function which is being declared.
     pub name: Identifier,
     /// The left parenthesis, opening the arguments.
@@ -227,6 +241,23 @@ impl Prototype {
     }
 }
 
+#[derive(new, Debug, Clone, Getters)]
+/// The receiver of the method.
+pub struct Receiver {
+    /// The left parenthesis, opening the receiver.
+    left_paren: Loc,
+    /// The receiver of the method.
+    receiver_name: Identifier,
+    /// The colon to specify the type.
+    colon: Loc,
+    /// The type specified.
+    ty: Box<Type>,
+    /// The right parenthesis, closing the receiver.
+    right_paren: Loc,
+}
+
+pub type Mutability = Option<Loc>;
+
 #[derive(new, Debug, Clone)]
 /// The argument of the function.
 pub struct Argument {
@@ -235,7 +266,7 @@ pub struct Argument {
     /// The type of the argument.
     pub ty: Type,
     /// If this argument is mutable.
-    pub mutability: Option<Loc>,
+    pub mutability: Mutability,
 }
 
 #[derive(new, Getters, Debug, Clone)]
@@ -266,8 +297,11 @@ pub mod expr {
     use std::collections::HashMap;
 
     use derive_new::new;
+    use either::Either;
 
-    use super::{Block, Identifier, IntLit, Loc, NameIndex, Type};
+    use crate::check::hir::expr::HIRExpr;
+
+    use super::{matcher::Switch, Block, Identifier, IntLit, Loc, Mutability, NameIndex, Type};
 
     #[derive(Debug, Clone)]
     /// A while loop.
@@ -295,7 +329,9 @@ pub mod expr {
         Binary(BinaryExpr),
         Assignment(AssignmentExpr),
         AccessProperty(Box<Expr>, Loc, Identifier),
-        SlotDecl { mutability: Option<Loc>, name: Identifier, ty: Type },
+        SlotDecl { mutability: Mutability, name: Identifier, ty: Type },
+        Let { mutable: bool, loc_or_let: Loc, name: Identifier, ty: Option<(Loc, Type)>, eq: Loc, expr: Box<Expr> },
+        Switch(Switch),
         Call(CallExpr),
         /// The use of a variable as an expression.
         Variable(Identifier),
@@ -311,6 +347,13 @@ pub mod expr {
         Return(ReturnExpr),
         Conditional(Conditional),
         WhileLoop(WhileLoop),
+        /// The defer statements are executed in reverse
+        /// order of declaration, when a block ends,
+        /// the function returns or any other action
+        /// which may interrupt the function.
+        Defer(Loc, Box<Expr>),
+
+        // TODO: Add sum type instantiation expression
     }
 
     #[derive(Debug, Clone)]
@@ -359,7 +402,7 @@ pub mod expr {
     /// Arrays are also included in this.
     pub enum LiteralExpr {
         /// An integer literal.
-        Int(IntLit),
+        Int(Type, IntLit),
     }
 
     #[derive(Debug, Clone)]
@@ -379,7 +422,7 @@ pub mod expr {
 
         /// The right hand side of the binary
         /// operator.
-        pub right_hand_side: Box<Expr>,
+        pub right_hand_side: Either<Box<Expr>, (Type, HIRExpr)>,
     }
 
     #[derive(Debug, Clone)]
@@ -405,6 +448,51 @@ pub mod expr {
         }
     }
 
+    /// Maybe we have information.
+    pub type ExprInfo = Option<ExprInfoData>;
+
+    /// Informations about an expression.
+    pub struct ExprInfoData {
+        /// The formal name of this expression.
+        pub formal_name: &'static str,
+        /// The description of this expression.
+        pub description: &'static str,
+        /// Examples of its usage.
+        pub examples: &'static [&'static str],
+        /// What you need to know when using this.
+        pub usage_notes: Option<&'static [&'static str]>,
+        /// Expressions related to this one.
+        pub related_expressions: Option<&'static [&'static str]>,
+        /// Regex-like illustration of what this
+        /// might match.
+        pub re_illustration: &'static str,
+        /// A tip for when to use it.
+        pub tip: &'static str,
+    }
+
+    impl ExprInfoData {
+        /// Constructs a new `ExprInfoData`.
+        pub const fn new(
+            formal_name: &'static str,
+            description: &'static str,
+            examples: &'static [&'static str],
+            usage_notes: Option<&'static [&'static str]>,
+            related_expressions: Option<&'static [&'static str]>,
+            re_illustration: &'static str,
+            tip: &'static str,
+        ) -> Self {
+            Self {
+                formal_name,
+                description,
+                examples,
+                usage_notes,
+                related_expressions,
+                re_illustration,
+                tip,
+            }
+        }
+    }
+
     #[derive(Debug, new, Clone)]
     /// A function call.
     pub struct CallExpr {
@@ -425,8 +513,9 @@ pub mod expr {
                 Expr::Binary(bin) => bin.left_hand_side.loc(),
                 Expr::Call(c) => c.callee.loc(),
                 Expr::Literal(lit) => match lit {
-                    LiteralExpr::Int(i) => i.0.clone(),
+                    LiteralExpr::Int(ty, i) => i.0.clone(),
                 },
+                Expr::Let { loc_or_let, .. } => loc_or_let.clone(),
                 Expr::GenericInstantiation(name, _) => name.loc().clone(),
                 Expr::Variable(v) => v.0.clone(),
                 Expr::SlotDecl { mutability: _, name, ty: _ } => name.0.clone(),
@@ -434,16 +523,17 @@ pub mod expr {
                 Expr::Conditional(Conditional { if_kw, .. }) => if_kw.clone(),
                 Expr::WhileLoop(WhileLoop {
                     while_kw,
-                    condition,
-                    block,
+                    ..
                 }) => while_kw.clone(),
-                Expr::InstantiateStruct(name, fields) => name.0.clone(),
+                Expr::InstantiateStruct(name, _) => name.0.clone(),
+                Expr::Defer(defer_kw, _) => defer_kw.clone(),
+                Expr::Switch(switch) => switch.switch_tok().clone(),
             }
         }
 
         pub fn replace_generic(&mut self, generics: &HashMap<NameIndex, Type>) {
             match self {
-                Expr::SlotDecl { mutability, name, ty } => {
+                Expr::SlotDecl { ty, .. } => {
                     if let Type::NamedType(decl_name) = ty {
                         if let Some(to) = generics.get(&decl_name.1) {
                             *ty = to.clone();
@@ -451,6 +541,31 @@ pub mod expr {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        /// Returns the name of this expression.
+        pub const fn name(&self) -> &'static str {
+            use Expr as E;
+
+            match self {
+                E::AsReference(_) => "address of expression",
+                E::Literal(_) => "literal expression",
+                E::Binary(_) => "binary expression",
+                E::Assignment(_) => "assignment statement",
+                E::AccessProperty(..) => "access property expression",
+                E::SlotDecl { .. } => "slot declaration statement",
+                E::Let { .. } => "let statement",
+                E::Call(_) => "function call",
+                E::Variable(_) => "name expression",
+                E::GenericInstantiation(..) => "generic function instantiation",
+                E::InstantiateStruct(..) => "struct instantiation expression",
+                E::Dereference(..) => "dereference expression",
+                E::Return(_) => "return statement",
+                E::Conditional(_) => "conditional statement",
+                E::WhileLoop(_) => "while loop",
+                E::Defer(_, _) => "defer statement",
+                E::Switch(_) => "switch statement",
             }
         }
     }
@@ -472,7 +587,7 @@ pub mod typing {
 
     use derive_new::new;
 
-    use super::{Identifier, IntLit, Loc, Prototype};
+    use super::{Identifier, IntLit, Loc, Mutability, Prototype};
 
     /*
 
@@ -504,7 +619,24 @@ pub mod typing {
         Bool,
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    impl PrimType {
+        /// Returns the size of this primitive.
+        pub fn size(&self) -> usize {
+            match self {
+                Self::Int(bits)
+                | Self::UInt(bits)
+                | Self::Float(bits) => match bits {
+                    TypeBits::B8 => 1,
+                    TypeBits::B16 => 2,
+                    TypeBits::B32 => 4,
+                    TypeBits::B64 => 8,
+                }
+                Self::Bool => 1,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Copy)]
     /// The bits of a type.
     pub enum TypeBits {
         /// An 8-bit-sized type.
@@ -581,7 +713,9 @@ pub mod typing {
             /// What this pointer is pointing too; its pointee.
             pointee: Box<Type>,
             /// If we can change the value at this location.
-            mutability: Option<Loc>,
+            mutability: Mutability,
+            /// The lifetime of the pointer if any.
+            lifetime: Option<usize>,
         },
         /// A pointer to a function.
         FunctionPointer(Prototype),
@@ -638,7 +772,7 @@ pub mod typing {
                 Type::FunctionPointer(proto) => {
                     proto.replace_generic(generics)
                 }
-                Type::Instantiated { name, lbrac, instantiated, rbrac } => {
+                Type::Instantiated { instantiated, .. } => {
                     instantiated.iter_mut().for_each(|ty| {
                         ty.replace_generic(generics)
                     })
@@ -646,10 +780,10 @@ pub mod typing {
                 Type::NamedType(name) => if let Some(to) = generics.get(&name.index()) {
                     *self = to.clone();
                 },
-                Type::Pointer { pointee, mutability } => {
+                Type::Pointer { pointee, .. } => {
                     pointee.replace_generic(generics)
                 }
-                Type::SizedArray { left_bracket, size, of, element_type, right_bracket } => {
+                Type::SizedArray { element_type, .. } => {
                     element_type.replace_generic(generics)
                 }
                 _ => {}
@@ -669,7 +803,7 @@ pub mod typing {
                 (Self::Primitive { ty, .. }, Self::Primitive { ty: ty2, .. }) => ty == ty2,
                 (Self::NamedType(named), Self::NamedType(named2)) => named == named2,
                 (Self::Void, Self::Void) => true,
-                (Self::Pointer { pointee, mutability }, Self::Pointer { pointee: pointee2, mutability: mutability2 }) => pointee == pointee2 && mutability.is_some() == mutability2.is_some(),
+                (Self::Pointer { pointee, mutability, lifetime: _ }, Self::Pointer { pointee: pointee2, mutability: mutability2, lifetime: _ }) => pointee == pointee2 && mutability.is_some() == mutability2.is_some(),
                 _ => false,
             }
         }
@@ -816,17 +950,135 @@ pub mod tdecl {
     }
 
     #[derive(Debug, Clone, new, PartialEq)]
+    /// A struct type.
+    pub struct Struct {
+        /// The fields of the struct.
+        pub fields: Vec<(
+            Identifier,
+            Type,
+        )>,
+    }
+
+    #[derive(Debug, Clone, new, PartialEq)]
     /// A type declared by the user.
     pub enum UserType {
-        /// A struct type.
-        Struct {
-            /// The fields of the struct.
-            fields: Vec<(
-                Identifier,
-                Type,
-            )>,
-        },
+        Struct(Struct),
+        Union(Vec<(Identifier, Type)>),
+        // /// A sum type.
+        // Sum {
+        //     variants: Vec<SumTypeVariant>,
+        // },
         //// An alias to another type.
         Alias(Type),
+    }
+
+    // #[derive(Debug, Clone, new, PartialEq, Getters)]
+    // /// A variant of a sum type.
+    // pub struct SumTypeVariant {
+    //     /// The name of the sum type variant.
+    //     name: Identifier,
+    //     /// The value of this sum type variant.
+    //     value: Option<Struct>,
+    //     /// The explicitly specified discriminant of this struct.
+    //     discriminant: Option<IntLit>,
+    // }
+}
+
+pub mod matcher {
+    /*!
+    
+    # The `matcher` module
+
+    This module includes everything (or almost everything)
+    related to the support of pattern matching within
+    endure.
+
+    We here have the switch statement itself, the match arms
+    and the patterns.
+
+    */
+
+    use self::expr::LiteralExpr;
+
+    use super::*;
+
+    #[derive(Debug, Clone, Getters, new)]
+    /// A `switch` statement.
+    pub struct Switch {
+        /// The `switch` keyword.
+        pub switch_tok: Loc,
+        /// What to switch on.
+        pub value: Box<Expr>,
+        /// The beginning of the patterns.
+        pub lkey_tok: Loc,
+        /// All of the specified patterns with
+        /// their cases.
+        pub patterns: Vec<Case>,
+        /// The end of the patterns.
+        pub rkey_tok: Loc,
+    }
+
+    #[derive(Debug, Clone, Getters, new)]
+    /// A single `case` in the `switch`.
+    pub struct Case {
+        /// The `case` keyword.
+        case: Loc,
+        /// The pattern which we are applying.
+        pattern: Pattern,
+        /// The block to be executed if the
+        /// pattern matches.
+        block: Block,
+    }
+
+    #[derive(Debug, Clone)]
+    /// A pattern to be matched.
+    /// 
+    /// TODO:
+    /// List patterns, struct destructuring,
+    /// guards in case statements
+    pub enum Pattern {
+        /// A literal to be matched.
+        Literal(LiteralExpr),
+        /// An exclusive range between two
+        /// integers.
+        ExclusiveRange {
+            /// Where this range begins.
+            begin: LiteralExpr,
+            /// The range token.
+            range_tok: Loc,
+            /// Where this range ends (n - 1).
+            end: LiteralExpr,
+        },
+        /// An inclusive range between two
+        /// integers.
+        InclusiveRange {
+            /// Where this range begins.
+            begin: LiteralExpr,
+            /// The range token.
+            range_tok: Loc,
+            /// Where this range ends.
+            end: LiteralExpr,
+        },
+        /// Destructure a structure with
+        /// its fields.
+        DeStructure {
+            /// The name of the structure.
+            name: Identifier,
+            /// The beginning of the fields.
+            lkey_tok: Loc,
+            /// The fields themselves which
+            /// were matched.
+            /// 
+            /// If no pattern is specified then
+            /// the pattern is the field name
+            /// itself.
+            fields: Vec<(Mutability, Identifier, Option<Pattern>)>,
+            /// Ignoring the rest of the fields.
+            ignore: Option<Loc>,
+            /// The end of the fields.
+            rkey_tok: Loc,
+        },
+        /// Matches anything.
+        WildCard(Mutability, Identifier),
     }
 }
