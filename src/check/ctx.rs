@@ -333,7 +333,7 @@ impl Context {
         add_user_type(
             current_namespace,
             name,
-            CtxUserType::new(ty, namespace_used_in_function),
+            CtxUserType::new(ty, HashMap::new(), namespace_used_in_function),
         )
     }
 

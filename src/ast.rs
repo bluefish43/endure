@@ -329,6 +329,11 @@ pub mod expr {
         Binary(BinaryExpr),
         Assignment(AssignmentExpr),
         AccessProperty(Box<Expr>, Loc, Identifier),
+        MethodCall {
+            base: Box<Expr>,
+            name: Identifier,
+            params: Vec<Expr>,
+        },
         SlotDecl { mutability: Mutability, name: Identifier, ty: Type },
         Let { mutable: bool, loc_or_let: Loc, name: Identifier, ty: Option<(Loc, Type)>, eq: Loc, expr: Box<Expr> },
         Switch(Switch),
@@ -528,6 +533,7 @@ pub mod expr {
                 Expr::InstantiateStruct(name, _) => name.0.clone(),
                 Expr::Defer(defer_kw, _) => defer_kw.clone(),
                 Expr::Switch(switch) => switch.switch_tok().clone(),
+                Expr::MethodCall { base, name, params } => base.loc(),
             }
         }
 
@@ -566,6 +572,7 @@ pub mod expr {
                 E::WhileLoop(_) => "while loop",
                 E::Defer(_, _) => "defer statement",
                 E::Switch(_) => "switch statement",
+                E::MethodCall { .. } => "method call"
             }
         }
     }

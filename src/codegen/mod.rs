@@ -32,7 +32,7 @@ use derive_getters::Getters;
 use inkwell::{
     attributes::{Attribute, AttributeLoc}, basic_block::BasicBlock, builder::Builder, context::{AsContextRef, Context}, data_layout::DataLayout, llvm_sys::{core::{LLVMAddAttributeAtIndex, LLVMCreateEnumAttribute, LLVMCreateTypeAttribute, LLVMGetEnumAttributeValue}, target::LLVMStoreSizeOfType, target_machine::LLVMGetHostCPUFeatures}, module::{Linkage, Module}, targets::{
         CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine, TargetTriple
-    }, types::{AnyType, AnyTypeEnum, ArrayType, AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType}, values::{AnyValue, AnyValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue}, AddressSpace, OptimizationLevel
+    }, types::{AnyType, AnyTypeEnum, ArrayType, AsTypeRef, BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType}, values::{AnyValue, AnyValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue}, AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel
 };
 
 use crate::{
@@ -48,6 +48,92 @@ use crate::{
 use self::llvm::Holder;
 
 mod llvm;
+
+macro_rules! float_compare {
+    ($self:expr, $pred:ident, $lhs:expr, $rhs:expr) => {
+        $self.builder()
+            .build_float_compare(
+                FloatPredicate::$pred,
+                $lhs.into_float_value(),
+                $rhs.into_float_value(),
+                ""
+            )
+            .unwrap()
+    }
+}
+
+macro_rules! int_compare {
+    ($self:expr, $pred:ident, $lhs:expr, $rhs:expr) => {
+        $self.builder()
+            .build_int_compare(
+                IntPredicate::$pred,
+                $lhs.into_int_value(),
+                $rhs.into_int_value(),
+                ""
+            )
+            .unwrap()
+    }
+}
+
+macro_rules! emmit_comparison_helper {
+    ($name:ident, $sint_pred:ident, $uint_pred:ident, $float_pred:ident) => {
+        /// Checks for (the predicate being compared to) between two types.
+        fn $name(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
+            use HIRType as T;
+            // this is different for different types
+            match ty {
+                T::Primitive { loc: _, ty } => match ty {
+                    PrimType::Int(_) => {
+                        int_compare!(
+                            self,
+                            $sint_pred,
+                            lhs,
+                            rhs
+                        )
+                    }
+                    PrimType::UInt(_)
+                    | PrimType::Bool => {
+                        int_compare!(
+                            self,
+                            $uint_pred,
+                            lhs,
+                            rhs
+                        )
+                    }
+                    PrimType::Float(_) => {
+                        float_compare!(
+                            self,
+                            $float_pred,
+                            lhs,
+                            rhs
+                        )
+                    }
+                }
+                T::Pointer { .. } => {
+                    // convert them to integers and compare them
+                    let left = self
+                        .builder()
+                        .build_ptr_to_int(lhs.into_pointer_value(), self.context().i64_type(), "")
+                        .unwrap()
+                        .as_basic_value_enum();
+                    let right = self
+                        .builder()
+                        .build_ptr_to_int(lhs.into_pointer_value(), self.context().i64_type(), "")
+                        .unwrap()
+                        .as_basic_value_enum();
+                    // we compare it as if it was an integer
+                    int_compare!(
+                        self,
+                        $uint_pred,
+                        left,
+                        right
+                    )
+                }
+                _ => unreachable!("Type is not supported by comparison operator")
+            }
+        }
+    }
+}
 
 #[repr(u32)]
 /// All of the current LLVM attributes.
@@ -274,6 +360,9 @@ pub struct ExportOptions {
     pub code_model: CodeModel,
     /// A specified target triple.
     pub triple: Option<String>,
+    /// The optimization options we're enabling
+    /// (or disabling)
+    pub opts: OptimizationOptions,
 }
 
 impl<'c> Emmitter<'c> {
@@ -404,13 +493,13 @@ impl<'c> Emmitter<'c> {
             )
         }
         
-        let block = self.context().append_basic_block(function_value, "");
+        let block = self.context().append_basic_block(function_value, "start");
         self.builder().position_at_end(block);
 
         self.push_scope(true, false);
 
         for decl in decl.block.stmts().iter() {
-            self.emmit_expr(decl);
+            self.emmit_expr(decl,);
         }
 
         self.if_not_finished(|builder| {
@@ -438,7 +527,7 @@ impl<'c> Emmitter<'c> {
                     .holder
                     .module()
                     .add_function(func, ty, Some(Linkage::External));
-                func.set_call_conventions(CallingConvention::Fast as u32);
+                // func.set_call_conventions(CallingConvention::Fast as u32);
                 func
             },
         }
@@ -685,14 +774,14 @@ impl<'c> Emmitter<'c> {
 
     /// Emmits machine code for the input expression.
     fn emmit_expr(&'c self, expr: &HIRExpr) -> AnyValueEnum<'c> {
-        self.emmit_expr_impl(expr, false)
+        self.emmit_expr_impl(expr, false, None)
     }
 
-    fn emmit_expr_impl(&'c self, expr: &HIRExpr, take_lvalue: bool) -> AnyValueEnum<'c> {
+    fn emmit_expr_impl(&'c self, expr: &HIRExpr, take_lvalue: bool, aggr_ptr: Option<PointerValue<'c>>) -> AnyValueEnum<'c> {
         use HIRExpr as HE;
 
         match expr {
-            HE::AsReference(other) => self.emmit_expr_impl(&other.1, true),
+            HE::AsReference(other) => self.emmit_expr_impl(&other.1, true, None),
             HE::Literal(lit) => self.emmit_lit(lit),
             HE::Binary(bin) => self.emmit_bin(bin),
             HE::Assignment(assignment) => {
@@ -701,7 +790,7 @@ impl<'c> Emmitter<'c> {
             }
             HE::SlotDecl(to, ty) => {
                 let ty = basic_type(self.llvm_type(ty));
-                let mem = self.builder().build_alloca(ty, "").unwrap();
+                let mem = self.builder().build_alloca(ty, "slot").unwrap();
                 self.set_var(to, mem.as_any_value_enum());
                 mem.as_any_value_enum()
             }
@@ -710,14 +799,18 @@ impl<'c> Emmitter<'c> {
                 if take_lvalue {
                     self.get_var(var.as_str())
                 } else {
-                    self.builder()
-                        .build_load(
-                            basic_type(self.llvm_type(vty)),
-                            self.get_var(var.as_str()).into_pointer_value(),
-                            "",
-                        )
-                        .unwrap()
-                        .as_any_value_enum()
+                    if vty.is_aggr() {
+                        self.get_var(var.as_str())
+                    } else {
+                        self.builder()
+                            .build_load(
+                                basic_type(self.llvm_type(vty)),
+                                self.get_var(var.as_str()).into_pointer_value(),
+                                "loaded variable",
+                            )
+                            .unwrap()
+                            .as_any_value_enum()
+                    }
                 }
             }
             HE::Switch(switch) => self.emmit_switch(switch),
@@ -728,13 +821,13 @@ impl<'c> Emmitter<'c> {
                     self.builder()
                         .build_load(
                             self.context().i32_type().ptr_type(AddressSpace::default()),
-                            self.emmit_expr_impl(&union_expr, true).into_pointer_value(),
-                            ""
+                            self.emmit_expr_impl(&union_expr, true, None).into_pointer_value(),
+                            "pointer to union"
                         )
                         .unwrap()
                         .as_any_value_enum()
                 } else {
-                    self.emmit_expr_impl(&union_expr, true)
+                    self.emmit_expr_impl(&union_expr, true, None)
                 };
                 self
                     .emmit_raw_union_access_property(
@@ -744,24 +837,24 @@ impl<'c> Emmitter<'c> {
                     )
                     .as_any_value_enum()
             }
-            HE::AccessStructProperty { struct_expr, struct_ty, mut property_index, property_ty, must_dereference_first: must_dereference_struct } => {
+            HE::AccessStructProperty { struct_expr, struct_ty, property_index, property_ty, must_dereference_first: must_dereference_struct } => {
                 let struct_value = if *must_dereference_struct {
                     self.builder()
                         .build_load(
                             self.context().i32_type().ptr_type(AddressSpace::default()),
-                            self.emmit_expr_impl(&struct_expr, true).into_pointer_value(),
-                            ""
+                            self.emmit_expr_impl(&struct_expr, false, None).into_pointer_value(),
+                            "pointer to struct"
                         )
                         .unwrap()
                         .into_pointer_value()
                 } else {
-                    self.emmit_expr_impl(&struct_expr, true).into_pointer_value()
+                    self.emmit_expr_impl(&struct_expr, true, None).into_pointer_value()
                 };
                 self
                     .emmit_raw_struct_access_property(
                         struct_value,
                         struct_ty,
-                        property_index,
+                        *property_index,
                         property_ty,
                         take_lvalue
                     )
@@ -784,20 +877,25 @@ impl<'c> Emmitter<'c> {
                     let argument = current_function
                         .get_nth_param(*index as u32)
                         .unwrap();
-                    // create local binding
-                    let local_argument = self.builder()
-                        .build_alloca(arg_type, "")
+
+                    // check if it is aggregate (byval pointer)
+                    if ty.is_aggr() {
+                        argument.as_any_value_enum()
+                    } else {
+                        // create local binding
+                        let local_argument = self.builder()
+                        .build_alloca(arg_type, "argument")
                         .unwrap();
 
-                    // store the value inside of the local binding
-                    if !arg_type.is_struct_type() && !arg_type.is_array_type() {
+                        // store the value inside of the local binding
+                        if !arg_type.is_struct_type() && !arg_type.is_array_type() {
                         // use store if regular type
                         self.builder()
                             .build_store(
                                 local_argument, argument
                             )
                             .unwrap();
-                    } else {
+                        } else {
                         // otherwise use memcpy
                         self.builder()
                             .build_memcpy(
@@ -808,11 +906,12 @@ impl<'c> Emmitter<'c> {
                                 arg_type.size_of().unwrap(),
                             )
                             .unwrap();
+                        }
+                        // set the argument's value locally
+                        self.set_var(name.as_str(), local_argument.as_any_value_enum());
+                        // return the allocated value for the argument
+                        local_argument.as_any_value_enum()
                     }
-                    // set the argument's value locally
-                    self.set_var(name.as_str(), local_argument.as_any_value_enum());
-                    // return the allocated value for the argument
-                    local_argument.as_any_value_enum()
                 }
             }
             HE::GlobalFunc(name, proto) => {
@@ -845,13 +944,13 @@ impl<'c> Emmitter<'c> {
                     .build_load(
                         basic_type(self.llvm_type(pointee)),
                         self.emmit_expr(&pointer).into_pointer_value(),
-                        ""
+                        "dereferenced pointer"
                     )
                     .unwrap()
                     .as_any_value_enum()
             }
-            HE::InstantiateUnion(union_ty, field, is_field_aggr) => self.emmit_instantiate_union(union_ty, field, is_field_aggr.as_ref()),
-            HE::InstantiateStruct(ty, fields) => self.emmit_instantiate_struct(ty, fields),
+            HE::InstantiateUnion(union_ty, field, is_field_aggr) => self.emmit_instantiate_union(union_ty, field, is_field_aggr.as_ref(), aggr_ptr),
+            HE::InstantiateStruct(ty, fields) => self.emmit_instantiate_struct(ty, fields, aggr_ptr),
             HE::Return(ret_expr) => self.emmit_ret(ret_expr),
             HE::Conditional(cond) => self.emmit_cond(cond),
             HE::WhileLoop(loo) => self.emmit_while(loo),
@@ -865,9 +964,11 @@ impl<'c> Emmitter<'c> {
     /// Emmits a literal as machine code.
     fn emmit_lit(&'c self, lit: &HIRLiteralExpr) -> AnyValueEnum<'c> {
         match lit {
-            HIRLiteralExpr::Int(t, i) => self.llvm_type(t)
-                .into_int_type()
-                .const_int(i.1 as u64, true),
+            HIRLiteralExpr::Int(t, i) => {
+                self.llvm_type(t)
+                    .into_int_type()
+                    .const_int(i.2, matches!(t, HIRType::Primitive { ty: PrimType::Int(_), .. }))
+            }
         }
         .as_any_value_enum()
     }
@@ -880,12 +981,12 @@ impl<'c> Emmitter<'c> {
             BinaryOp::Plus => match expr.op_ty {
                 BinOpType::Int | BinOpType::UInt => self
                     .builder()
-                    .build_int_add(lhs.into_int_value(), rhs.into_int_value(), "")
+                    .build_int_add(lhs.into_int_value(), rhs.into_int_value(), "binary_op_result")
                     .unwrap()
                     .into(),
                 BinOpType::Float => self
                     .builder()
-                    .build_float_add(lhs.into_float_value(), rhs.into_float_value(), "")
+                    .build_float_add(lhs.into_float_value(), rhs.into_float_value(), "binary op result")
                     .unwrap()
                     .into(),
             },
@@ -893,28 +994,27 @@ impl<'c> Emmitter<'c> {
     }
 
     /// Emmits the instantiation of an union.
-    fn emmit_instantiate_union(&'c self, hir_union_ty: &HIRType, field: &HIRExpr, is_field_aggr: Option<&HIRType>) -> AnyValueEnum<'c> {
+    fn emmit_instantiate_union(
+        &'c self, hir_union_ty: &HIRType, 
+        field: &HIRExpr, 
+        is_field_aggr: Option<&HIRType>,
+        aggr_ptr: Option<PointerValue<'c>>,
+    ) -> AnyValueEnum<'c> {
         let uni_ty = basic_type(self.llvm_type(hir_union_ty));
         // allocate memory for the struct
-        let uni_mem = self.builder()
-            .build_alloca(uni_ty, "")
-            .unwrap();
-        // evaluate the field
-        let field_value = basic_value(self.emmit_expr(field));
-        // set the index
-        if let Some(aggr) = is_field_aggr {
-            self.builder()
-                .build_memcpy(
-                    uni_mem,
-                    8,
-                    field_value.into_pointer_value(),
-                    8,
-                    self.context()
-                        .i64_type()
-                        .const_int(aggr.size() as u64, false)
-                )
-                .unwrap();
+        let uni_mem = if let Some(aggr_ptr) = aggr_ptr {
+            aggr_ptr
         } else {
+            self.builder()
+                .build_alloca(uni_ty, "instantiated union")
+                .unwrap()
+        };
+        // evaluate the field
+        // set the index
+        if is_field_aggr.is_some() {
+            self.emmit_expr_impl(field, false, Some(uni_mem));
+        } else {
+            let field_value = basic_value(self.emmit_expr(field));
             self.builder()
                 .build_store(
                     uni_mem,
@@ -926,61 +1026,65 @@ impl<'c> Emmitter<'c> {
     }
 
     /// Emmits the instantiation of a struct.
-    fn emmit_instantiate_struct(&'c self, hir_stct_ty: &HIRType, fields: &[(HIRExpr, Option<HIRType>)]) -> AnyValueEnum<'c> {
+    fn emmit_instantiate_struct(&'c self, hir_stct_ty: &HIRType, fields: &[(HIRExpr, Option<HIRType>)], aggr_ptr: Option<PointerValue<'c>>) -> AnyValueEnum<'c> {
         let stct_ty = basic_type(self.llvm_type(hir_stct_ty));
         // allocate memory for the struct
-        let stct_mem = self.builder()
-            .build_alloca(stct_ty, "")
-            .unwrap();
-        // set the values of the structs
-        for (index, field) in fields.iter().enumerate() {
-            let field_address = self.builder()
-                .build_struct_gep(
-                    stct_ty,
-                    stct_mem,
-                    index as u32,
-                    ""
-                )
-                .unwrap();
-            let field_value = basic_value(self.emmit_expr(&field.0));
-            if let Some(aggr_ty) = &field.1 {
-                // if it is aggregate, memcpy it inside
-                
-                // get size of type
-                let size = self.context().i64_type().const_int(aggr_ty.size() as u64, false);
-                // make memcpy
-                self.builder()
-                    .build_memcpy(
-                        field_address,
-                        8,
-                        field_value.into_pointer_value(),
-                        8,
-                        size,
+        let stct_mem = if let Some(aggr_ptr) = aggr_ptr {
+            aggr_ptr
+        } else {
+            self.builder()
+                .build_alloca(stct_ty, "instantiated struct")
+                .unwrap()
+        };
+        if let HIRType::AlignedStruct(aligned_fields) = hir_stct_ty {
+            // set the values of the structs
+            for (index, field) in fields.iter().enumerate() {
+                let field_is_aggr = field.1.as_ref().map(|t| t.is_aggr()).unwrap_or_default();
+                let actual_index = index_aligned(
+                    aligned_fields.iter(),
+                    index as u32
+                );
+                let field_address = self.builder()
+                    .build_struct_gep(
+                        stct_ty,
+                        stct_mem,
+                        actual_index as u32,
+                        "address of field"
                     )
                     .unwrap();
-            } else {
-                // otherwise just store it
-                self.builder()
-                    .build_store(
-                        field_address,
-                        field_value
-                    )
-                    .unwrap();
+                if field_is_aggr {
+                    // if it is aggregate, instantiate it directly
+                    // get size of type
+                    self.emmit_expr_impl(&field.0, false, Some(field_address));
+                } else {
+                    let field_value = basic_value(self.emmit_expr(&field.0));
+                    // otherwise just store it
+                    self.builder()
+                        .build_store(
+                            field_address,
+                            field_value
+                        )
+                        .unwrap();
+                }
             }
+            stct_mem.as_any_value_enum()
+        } else {
+            unreachable!("Instantiating non-aligned struct type")
         }
-        stct_mem.as_any_value_enum()
     }
 
     /// Emmits machine code for an assignment.
     fn emmit_assignment(&'c self, assignment: &HIRAssignmentExpr) {
-        let lhs = basic_value(self.emmit_expr_impl(&assignment.0.left_hand_side, true));
-        let value = basic_value(self.emmit_expr(&assignment.0.right_hand_side));
+        let lhs = basic_value(self.emmit_expr_impl(&assignment.0.left_hand_side, true, None));
+        let value = basic_value(self.emmit_expr_impl(&assignment.0.right_hand_side, false, Some(lhs.into_pointer_value())));
 
-        self.emmit_raw_assignment(
-            lhs,
-            value,
-            assignment.1.as_ref()
-        );
+        if !assignment.1.as_ref().map(|t| t.is_aggr()).unwrap_or(true) {
+            self.emmit_raw_assignment(
+                lhs,
+                value,
+                assignment.1.as_ref()
+            );
+        }
     }
 
     /// What does the ACTUAL assignment.
@@ -1016,7 +1120,7 @@ impl<'c> Emmitter<'c> {
             let output = self.builder()
                 .build_alloca(
                     basic_type(self.llvm_type(aggr_ty)),
-                    ""
+                    "aggregate return value"
                 )
                 .unwrap();
 
@@ -1027,7 +1131,7 @@ impl<'c> Emmitter<'c> {
             }
     
             self.builder()
-                .build_call(callee.into_function_value(), &params, "")
+                .build_call(callee.into_function_value(), &params, "call")
                 .unwrap();
 
             output.into()
@@ -1037,7 +1141,7 @@ impl<'c> Emmitter<'c> {
             }
     
             self.builder()
-                .build_call(callee.into_function_value(), &params, "")
+                .build_call(callee.into_function_value(), &params, "call")
                 .unwrap()
                 .as_any_value_enum()
         }
@@ -1056,7 +1160,7 @@ impl<'c> Emmitter<'c> {
         self.builder()
             .position_at_end(current_block);
         // evaluate what to match
-        let matched_value = basic_value(self.emmit_expr_impl(&switch.value(), true));
+        let matched_value = basic_value(self.emmit_expr_impl(&switch.value(), true, None));
 
         let mut all_obtained = vec![];
         // this is the block to jump to after a case
@@ -1137,7 +1241,7 @@ impl<'c> Emmitter<'c> {
             .unwrap();
         // this is where to go if it matched
         let go_to_if_matched = self.context()
-            .append_basic_block(current_block.get_parent().unwrap(), "pattern: matched");
+            .append_basic_block(current_block.get_parent().unwrap(), "pattern matched");
 
         if let P::WildCard { ty, is_aggregate, name } = pattern {
             // Here we have to put this name in scope
@@ -1152,14 +1256,25 @@ impl<'c> Emmitter<'c> {
             let allocating_ty = basic_type(self.llvm_type(ty));
             // allocate for the variable
             let allocated_space = self.builder()
-                .build_alloca(allocating_ty, "")
+                .build_alloca(allocating_ty, "wildcard pattern binding")
                 .unwrap();
             // set variable
             self.set_var(name, allocated_space.as_any_value_enum());
             // store value
             self.emmit_raw_assignment(
                 allocated_space.as_basic_value_enum(),
-                value,
+                if !is_aggregate {
+                    self.builder()
+                        .build_load(
+                            allocating_ty,
+                            value.into_pointer_value(),
+                            ""
+                        )
+                        .unwrap()
+                        .as_basic_value_enum()
+                } else {
+                    value
+                },
                 if *is_aggregate {
                     Some(ty)
                 } else {
@@ -1173,13 +1288,19 @@ impl<'c> Emmitter<'c> {
         } else {
             // this is where to go if it didn't match
             let go_to_if_didnt_match = self.context()
-                .append_basic_block(current_block.get_parent().unwrap(), "pattern: unmatched");
+                .append_basic_block(current_block.get_parent().unwrap(), "case not matched");
 
             match pattern {
                 P::Literal(literal_ty, literal) => {
                     // check if is equal to literal
                     let literal = basic_value(self.emmit_lit(literal));
-                    let jump = self.emmit_eq(literal_ty, value, literal);
+                    let loaded_value = self.builder()
+                        .build_load(
+                            basic_type(self.llvm_type(literal_ty)),
+                            value.into_pointer_value(),
+                            ""
+                        ).unwrap();
+                    let jump = self.emmit_eq(literal_ty, loaded_value, literal);
                     // build conditional jump
                     self.builder()
                         .build_conditional_branch(
@@ -1190,15 +1311,21 @@ impl<'c> Emmitter<'c> {
                         .unwrap();
                 }
                 P::Range { value_ty, begin, end } => {
+                    let loaded_value = self.builder()
+                        .build_load(
+                            basic_type(self.llvm_type(value_ty)),
+                            value.into_pointer_value(),
+                            ""
+                        ).unwrap();
                     // get start and end literals
                     let start = basic_value(self.emmit_lit(begin));
                     let end = basic_value(self.emmit_lit(end));
                     // check if it is between bounds
-                    let ge_to_start = self.emmit_ge(value_ty, value, start);
-                    let le_to_end = self.emmit_le(value_ty, value, end);
+                    let ge_to_start = self.emmit_ge(value_ty, loaded_value, start);
+                    let le_to_end = self.emmit_le(value_ty, loaded_value, end);
                     // do an and
                     let is_within_bounds = self.builder()
-                        .build_and(ge_to_start, le_to_end, "")
+                        .build_and(ge_to_start, le_to_end, "is_within_range_bounds")
                         .unwrap();
                     // build conditional jump
                     self.builder()
@@ -1279,7 +1406,7 @@ impl<'c> Emmitter<'c> {
                                 // other fields
                                 matched_next = Some(
                                     self.context()
-                                        .append_basic_block(matched_next.unwrap_or(go_to_if_matched).get_parent().unwrap(), "")
+                                        .append_basic_block(matched_next.unwrap_or(go_to_if_matched).get_parent().unwrap(), "next field basic block")
                                 );
                             }
                         }
@@ -1293,42 +1420,14 @@ impl<'c> Emmitter<'c> {
             }
         }
     }
-
-    /// Checks for equality between two types.
-    fn emmit_eq(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
-        // TODO: Checking for equality is not implemented
-        todo!()
-    }
-
-    /// Checks for difference between two types.
-    fn emmit_ne(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
-        // TODO: Checking for difference is not implemented
-        todo!()
-    }
-
-    /// Checks for ordering (less than) between two types.
-    fn emmit_lt(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
-        // TODO: Checking for ordering (less than) is not implemented
-        todo!()
-    }
-
-    /// Checks for ordering (less than or equal) between two types.
-    fn emmit_le(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
-        // TODO: Checking for ordering (less than or equal) is not implemented
-        todo!()
-    }
-
-    /// Checks for ordering (greater than) between two types.
-    fn emmit_gt(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
-        // TODO: Checking for ordering (greater than) is not implemented
-        todo!()
-    }
-
-    /// Checks for ordering (greater than or equal) between two types.
-    fn emmit_ge(&'c self, ty: &HIRType, lhs: BasicValueEnum<'c>, rhs: BasicValueEnum<'c>) -> IntValue<'c> {
-        // TODO: Checking for ordering (greater than or equal) is not implemented
-        todo!()
-    }
+    
+    // emmit the comparisons
+    emmit_comparison_helper!(emmit_eq, EQ, EQ, OEQ);
+    emmit_comparison_helper!(emmit_ne, NE, NE, ONE);
+    emmit_comparison_helper!(emmit_lt, SLT, ULT, OLT);
+    emmit_comparison_helper!(emmit_le, SLE, ULE, OLE);
+    emmit_comparison_helper!(emmit_gt, SGT, UGT, OGT);
+    emmit_comparison_helper!(emmit_ge, SGE, UGE, OGE);
 
     fn emmit_raw_struct_access_property(
         &'c self,
@@ -1342,19 +1441,20 @@ impl<'c> Emmitter<'c> {
             property_index = index_aligned(
                 struct_ty.iter(),
                 property_index,
-            ) ;
+            );
         } else {
             panic!("Unaligned struct type found when accessing a property of a struct")
         }
         let struct_type = self.llvm_type(struct_ty);
         let property_type = self.llvm_type(property_ty);
+        eprintln!("accessing index: {property_index}");
 
         let address = self.builder()
             .build_struct_gep(
                 basic_type(struct_type),
                 struct_value,
                 property_index,
-                ""
+                "address of field"
             )
             .unwrap();
 
@@ -1365,7 +1465,7 @@ impl<'c> Emmitter<'c> {
                 let memory = self.builder()
                     .build_alloca(
                         basic_type(self.llvm_type(property_ty)),
-                        ""
+                        "aggregate struct field load"
                     )
                     .unwrap();
                 self.builder()
@@ -1385,7 +1485,7 @@ impl<'c> Emmitter<'c> {
                     .build_load(
                         basic_type(property_type),
                         address,
-                        ""
+                        "struct field load"
                     )
                     .unwrap()
                     .as_basic_value_enum()
@@ -1408,7 +1508,7 @@ impl<'c> Emmitter<'c> {
                 let memory = self.builder()
                     .build_alloca(
                         basic_type(self.llvm_type(property_ty)),
-                        ""
+                        "aggregate union field load"
                     )
                     .unwrap();
                 self.builder()
@@ -1425,13 +1525,13 @@ impl<'c> Emmitter<'c> {
                 memory.as_basic_value_enum()
             } else {
                 self.builder()
-                .build_load(
-                    basic_type(property_type),
-                    union_value,
-                    ""
-                )
-                .unwrap()
-                .as_basic_value_enum()
+                    .build_load(
+                        basic_type(property_type),
+                        union_value,
+                        "union field load"
+                    )
+                    .unwrap()
+                    .as_basic_value_enum()
             }
         }
     }
@@ -1441,7 +1541,7 @@ impl<'c> Emmitter<'c> {
         if let Some(aggr_ty) = &expr.aggregate {
             // aggregate return
             let value = if let Some(val) = &expr.expr {
-                basic_value(self.emmit_expr_impl(&val, true))
+                basic_value(self.emmit_expr_impl(&val, true, None))
             } else {
                 unreachable!()
             };
@@ -1504,12 +1604,12 @@ impl<'c> Emmitter<'c> {
         let true_block = self.context()
             .append_basic_block(
                 current_function,
-                ""
+                "cond true"
             );
         let false_or_end_block = self.context()
             .append_basic_block(
                 current_function,
-                ""
+                "cond false"
             );
 
         // generate branch
@@ -1555,7 +1655,7 @@ impl<'c> Emmitter<'c> {
                 let end_block = self.context()
                     .append_basic_block(
                         current_function,
-                        ""
+                        "cond end"
                     );
                 // set insert block
                 self.builder()
@@ -1597,13 +1697,13 @@ impl<'c> Emmitter<'c> {
             .unwrap();
         // get blocks
         let condition_block = self.context()
-            .append_basic_block(current_function, "");
+            .append_basic_block(current_function, "while condition");
 
         let body_block = self.context()
-            .append_basic_block(current_function, "");
+            .append_basic_block(current_function, "while block");
 
         let after_block = self.context()
-            .append_basic_block(current_function, "");
+            .append_basic_block(current_function, " while after");
 
         // build condition
         self.builder()
@@ -1661,7 +1761,7 @@ impl<'c> Emmitter<'c> {
             .build_int_to_ptr(
                 self.context().i8_type().const_int(0, false),
                 self.context().i8_type().ptr_type(AddressSpace::default()),
-                "",
+                "const null",
             )
             .unwrap()
             .into()
@@ -1733,6 +1833,7 @@ fn index_aligned<'a>(iter: impl Iterator<Item = &'a (HIRType, bool)>, index: u32
     for (actual_idx, (_, is_alignment)) in iter.enumerate() {
         if !*is_alignment {
             if i == index {
+                eprintln!("actual {actual_idx} -- took {i}");
                 return actual_idx as u32;
             }
             i += 1;
@@ -1753,4 +1854,19 @@ pub struct EmmittedPattern<'c> {
     /// Where you want to go if the pattern wasn't
     /// matched.
     unmatched: Option<BasicBlock<'c>>,
+}
+
+/// Options to apply during the optimization of the
+/// program.
+pub struct OptimizationOptions {
+    /// Uses C standart library functions 
+    pub c_intrinsic_optimization: bool,
+}
+
+impl Default for OptimizationOptions {
+    fn default() -> Self {
+        Self {
+            c_intrinsic_optimization: true,
+        }
+    }
 }

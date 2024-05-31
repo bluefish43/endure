@@ -455,6 +455,8 @@ pub mod help {
                             }
                         }
                     }
+                    "command" | "cmd" => {
+                    }
                     "help" => {
                         controller.help_for_helper()?;
                     }
@@ -791,7 +793,7 @@ pub mod args {
 
     use std::{fmt::Display, num::ParseIntError};
 
-    use crate::codegen::{ExportFormat, ExportOptions};
+    use crate::codegen::{ExportFormat, ExportOptions, OptimizationOptions};
 
     use super::*;
 
@@ -885,6 +887,7 @@ pub mod args {
                 use_pie: false,
                 code_model: CodeModel::Medium,
                 triple: None,
+                opts: OptimizationOptions::default(),
             });
             
             // parse flags until we can
@@ -903,7 +906,7 @@ pub mod args {
                         settings.export_options.output = output_file;
                     }
                     a if a == "--opt-level"
-                            || a.starts_with("O") => {
+                            || a.starts_with("-O") => {
                         if a == "--opt-level" {
                             // parse next argument as optimization level
                             let optlevel_string = require_from_iter(
@@ -921,7 +924,7 @@ pub mod args {
                                 "the '-O[0-3]' option".to_string(),
                             ))
                         } else {
-                            let optlevel_str = &a[1..];
+                            let optlevel_str = &a[2..];
                             
                             let optlevel = parse_optlevel_from_str(optlevel_str)?;
 
@@ -961,6 +964,19 @@ pub mod args {
                         )?;
                         let format = parse_format_from_str(&export_format_string)?;
                         settings.export_options.format = format;
+                    }
+                    "-G" => {
+                        // generation options
+                        let second_command = require_from_iter(
+                            &mut iter,
+                            "mode",
+                            "the option -G".to_string()
+                        )?;
+                        parse_code_generation_option(
+                            &mut iter,
+                            &mut settings,
+                            &second_command
+                        )?;
                     }
                     // did not match
                     _ => {
@@ -1105,6 +1121,63 @@ pub mod args {
                     ))
                 }
             }
+        }
+
+        /// Parses a code generation option from the iterator
+        /// into the settings. For example: `-G enable c-intrinsic-optimization`
+        pub fn parse_code_generation_option(
+            iter: &mut impl Iterator<Item = String>,
+            options: &mut Settings,
+            mode: &str
+        ) -> Result<(), ArgumentParsingError> {
+            let arg = require_from_iter(
+                iter,
+                "argument",
+                format!("the option -G '{mode}'")
+            )?;
+
+            match mode {
+                "disable" | "d" => {
+                    parse_code_generation_option_impl(
+                        options,
+                        &arg,
+                        false
+                    )
+                }
+                "e" | "enable" => {
+                    parse_code_generation_option_impl(
+                        options,
+                        &arg,
+                        true
+                    )
+                }
+                _ => Err(APE::new_invalid_option_for(
+                    mode.to_string(),
+                    "for the code generation option mode".to_string(),
+                    Some("expected either 'd', 'disable', 'e' or 'enable'"),
+                ))
+            }
+        }
+
+        pub fn parse_code_generation_option_impl(
+            options: &mut Settings,
+            option: &str,
+            value: bool
+        ) -> Result<(), ArgumentParsingError> {
+            match option {
+                "c-intrinsic-optimization" => {
+                    options.export_options.opts.c_intrinsic_optimization = value;
+                }
+                _ => {
+                    return Err(APE::new_invalid_option_for(
+                        option.to_string(),
+                        "for the code generation option to change".to_string(),
+                        None,
+                    ));
+                }
+            }
+
+            Ok(())
         }
     }
 

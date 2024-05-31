@@ -38,7 +38,7 @@ use crate::{
         expr::{
             AsReferenceExpr, AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Conditional,
             Expr, LiteralExpr, ReturnExpr, WhileLoop,
-        }, generics::Generic, matcher::{Case, Pattern, Switch}, tdecl::{Struct, TypeDecl, UserType}, typing::{NameIndex, PrimType, Type, TypeBits}, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, Mutability, NamespaceDecl, Prototype
+        }, generics::Generic, matcher::{Case, Pattern, Switch}, tdecl::{Struct, TypeDecl, UserType}, typing::{NameIndex, PrimType, Type, TypeBits}, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, Mutability, NamespaceDecl, Prototype, Receiver
     },
     check::{hir::{expr::HIRLiteralExpr, HIRArgument}, namespaces::Member},
 };
@@ -169,6 +169,10 @@ impl GenericFunction {
 pub struct CtxUserType {
     /// The actual user defined type.
     ty: UserType,
+    /// The methods defined for this user
+    /// type (functions with this as their
+    /// receiver).
+    methods: HashMap<NameIndex, ActFunction>,
     /// The namespace where the function
     /// is defined.
     ///
@@ -235,7 +239,29 @@ impl Checker {
             Decl::FunctionDecl(function_decl) => {
                 let fdecl = function_decl;
 
-                if fdecl.prototype.generics().is_none() {
+                if let Some(receiver) = &fdecl.prototype.receiver {
+                    if let Type::NamedType(named) = &**receiver.ty() {
+                        self.collect_method(
+                            named,
+                            function_decl,
+                        )
+                    } else if let Type::Pointer { pointee, .. } = &**receiver.ty() {
+                        if let Type::NamedType(named) = &**pointee {
+                            self.collect_method(
+                                named,
+                                function_decl,
+                            )
+                        } else {
+                            self.add_error(
+                                CheckerError::InvalidTypeAsReceiver(function_decl.prototype.name.clone(), (**receiver.ty()).clone())
+                            );
+                        }
+                    } else {
+                        self.add_error(
+                            CheckerError::InvalidTypeAsReceiver(function_decl.prototype.name.clone(), (**receiver.ty()).clone())
+                        );
+                    }
+                } else if fdecl.prototype.generics().is_none() {
                     // check if it already existed and if yes
                     // add the error
                     if let Err(error) = self
@@ -277,6 +303,50 @@ impl Checker {
             Decl::NamespaceDecl(namespace) => {
                 self.collect_namespace_impl(namespace, true);
             }
+        }
+    }
+
+    fn collect_method(
+        &mut self,
+        named: &Identifier,
+        function_decl: &FunctionDecl,
+    ) {
+        let fdecl = function_decl;
+
+        if let Some(Member::Type(ty)) = self.ctx.lookup_member(&named.index()) {
+            match self.ctx.insert_function(function_decl.prototype.name.index(), function_decl.prototype.clone()) {
+                Ok(f) => match f {
+                    Member::Function(f) => {
+                        if let Some(_) = ty.borrow_mut()
+                            .methods
+                            .insert(
+                                function_decl.prototype.name.index(),
+                                Rc::clone(&f)
+                            ) {
+                                self.add_error(
+                                    CheckerError::MethodRedefinition {
+                                        aggr: named.clone(),
+                                        name: function_decl.prototype.name.clone(),
+                                    }
+                                )
+                            }
+                    },
+                    _ => unreachable!(),
+                }
+                Err(error) => {
+                    self.add_error(CheckerError::AddMember(
+                        fdecl.prototype.name().loc().clone(),
+                        error,
+                    ));
+                }
+            }
+        } else {
+            self.add_error(
+                CheckerError::TypeMustBeDefinedAtTimeOfDefinitionForReceiver {
+                    function: function_decl.prototype.name.clone(),
+                    name: named.clone(),
+                }
+            );
         }
     }
 
@@ -707,6 +777,9 @@ impl Checker {
                 self.pass_access_property(base, dot.clone(), prop)
                     .map(|v| (v.0, v.1))
             },
+            Expr::MethodCall { base, name, params } => {
+                self.pass_method_call(&base, name, &params)
+            }
             Expr::Binary(binary) => {
                 if matches!(state, ExprState::IsStmt) {
                     self.add_error(CheckerError::InvalidExpressionAsStatement(
@@ -1008,7 +1081,7 @@ impl Checker {
     /// Validates a literal expression.
     fn pass_lit_expr(&mut self, expr: &LiteralExpr, expected_type: Option<Type>) -> Option<(Type, HIRExpr)> {
         match expr {
-            LiteralExpr::Int(ty, i) => {
+            LiteralExpr::Int(_, i) => {
                 // return an int type
                 if let Some(Type::Primitive { loc, ty: PrimType::Int(bits) }) = expected_type {
                     let max_value = match bits {
@@ -1147,7 +1220,7 @@ impl Checker {
                                 }
                                 
                                 // pass field expr
-                                let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(field_expr, ExprState::IsExpr, None)?;
+                                let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(field_expr, ExprState::IsExpr, Some(field.1.clone()))?;
 
                                 if !self.types_are_same(spec_name.loc(), &spec_field_ty, &field.1)? {
                                     self.add_error(CheckerError::WrongTyForField {
@@ -1193,10 +1266,10 @@ impl Checker {
                         None
                     } else {
                         let (spec_field_name, spec_field_expr) = expr_fields.first().cloned().unwrap();
-                        let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(&spec_field_expr, ExprState::IsExpr, None)?;
                         
                         for (field_name, field_ty) in fields.iter() {
                             if field_name == &spec_field_name {
+                                let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(&spec_field_expr, ExprState::IsExpr, Some(field_ty.clone()))?;
                                 if !self.types_are_same(spec_field_name.loc(), &field_ty, &spec_field_ty)? {
                                     self.add_error(CheckerError::WrongTyForField {
                                         struct_name: struct_name.clone(),
@@ -1347,6 +1420,23 @@ impl Checker {
                     None
                 }
                 
+            } else if let CtxUserType { ty: UserType::Union(fields), .. } = &*actt.borrow() {
+
+                if let Some((field_index, (_, field_type))) = fields.iter().enumerate().find(|element| element.1.0.index() == prop.index()) {
+                    let expr = HIRExpr::new_access_union_property(
+                        Box::new(base_val),
+                        self.pass_ty(field_type.clone())?,
+                        requires_dereferencing,
+                    );
+                    
+                    Some((field_type.clone(), expr, life_time))
+                } else {
+                    self.add_error(
+                        CheckerError::NoSuchPropAtStruct(base_ty, prop.clone())
+                    );
+                    None
+                }
+                
             } else {
                 self.add_error(
                     CheckerError::AccPropOfNonAggrTy(dot, base_ty)
@@ -1358,6 +1448,196 @@ impl Checker {
                 CheckerError::AccPropOfNonAggrTy(dot, base_ty)
             );
             None
+        }
+    }
+
+    /// Validates the calling of a method.
+    fn pass_method_call(&mut self, base: &Expr, method_name: &Identifier, params: &[Expr]) -> Option<(Type, HIRExpr)> {
+        // get the type and HIR for base
+        let (base_ty, base_hir) = self.pass_reachable_expr(base, ExprState::IsExpr, None)?;
+        
+        let mut params_hir = vec![];
+        for param in params {
+            params_hir.push(
+                self.pass_reachable_expr(param, ExprState::IsExpr, None)?
+            );
+        }
+
+        // check if it is a named type
+        if let Type::NamedType(name) = &base_ty {
+            // check if this type actually exists
+            if let Some(Member::Type(user_type)) = self.ctx.lookup_member(&name.index()) {
+                // check if method exists
+                let binding = user_type.borrow();
+                if let Some(method) = binding.methods.get(&method_name.index()) {
+                    // get its name
+                    let method_binding = method.borrow();
+                    let proto = method_binding.proto.clone();
+                    let name_of_function = method_binding.full_name(&self.collection);
+                    drop(method_binding);
+
+                    let proto_of_function = self.pass_proto(&proto, method)?;
+                    // check if it actually takes it by value
+                    let base_hir = if &base_ty == &**proto.receiver.as_ref().unwrap().ty() {
+                        base_hir
+                    } else {
+                        // if it's supposed to take by reference append `HIRAsReferenceExpr` to the base
+                        HIRExpr::AsReference(
+                            HIRAsReferenceExpr(
+                                base.loc(),
+                                Box::new(
+                                    base_hir
+                                )
+                            )
+                        )
+                    };
+
+                    if params_hir.len() != proto.arguments.len() {
+                        self.add_error(CheckerError::FuncGotDiffParamSizeThanInProto {
+                            call_at: method_name.loc().clone(),
+                            in_proto: proto.arguments().len(),
+                            received: params.len(),
+                            type_of_func_is: Type::FunctionPointer(proto.clone()),
+                        });
+                        return None;
+                    }
+
+                    let mut actual_params = vec![base_hir];
+
+                    for ((ty, hir), arg) in params_hir.into_iter().zip(proto.arguments.iter()) {
+                        if !self.types_are_same(method_name.loc(), &ty, &arg.ty)? {
+                            self.add_error(
+                                CheckerError::WrongParamTy {
+                                    param: arg.name.index(),
+                                    expected: arg.ty.clone(),
+                                    received: ty.clone(),
+                                    expr_loc: method_name.0.clone(),
+                                }
+                            );
+                        }
+                        actual_params.push(hir);
+                    }
+
+                    Some((
+                        (**proto.return_type()).clone(),
+                        HIRExpr::new_call(
+                            HIRCallExpr::new(
+                                Box::new(HIRExpr::new_global_func(
+                                    name_of_function,
+                                    proto_of_function
+                                )),
+                                actual_params,
+                                self.type_is_aggregate((**proto.return_type()).clone()),
+                            )
+                        )
+                    ))
+                } else {
+
+                    self.add_error(
+                        CheckerError::MethodNotFoundForAggr {
+                            aggr: name.clone(),
+                            method: method_name.clone(),
+                        }
+                    );
+                    None
+                }
+            } else {
+                self.add_error(
+                    CheckerError::NamedTypeNotFound(name.clone())
+                );
+                None
+            }
+        } else if let Type::Pointer { pointee, mutability, lifetime } = &base_ty {
+            if let Type::NamedType(name) = &**pointee {
+                // call on method which takes by-reference
+                // check if this type actually exists
+                if let Some(Member::Type(user_type)) = self.ctx.lookup_member(&name.index()) {
+                    // check if method exists
+                    let binding = user_type.borrow();
+                    if let Some(method) = binding.methods.get(&method_name.index()) {
+                        // get its name
+                        let method_binding = method.borrow();
+                        let proto = method_binding.proto.clone();
+                        let name_of_function = method_binding.full_name(&self.collection);
+                        drop(method_binding);
+
+                        let proto_of_function = self.pass_proto(&proto, method)?;
+                        // check if it actually takes it by value
+                        let base_hir = if &base_ty == &**proto.receiver.as_ref().unwrap().ty() {
+                            base_hir
+                        } else {
+                            // if it's supposed to take by reference append `HIRAsReferenceExpr` to the base
+                            self.add_error(
+                                CheckerError::CallMethodWhichTakesByValueRecOnPtr {
+                                    aggr: name.clone(),
+                                    method: method_name.clone(),
+                                }
+                            );
+                            return None;
+                        };
+
+                        if params_hir.len() != proto.arguments.len() {
+                            self.add_error(CheckerError::FuncGotDiffParamSizeThanInProto {
+                                call_at: method_name.loc().clone(),
+                                in_proto: proto.arguments().len(),
+                                received: params.len(),
+                                type_of_func_is: Type::FunctionPointer(proto.clone()),
+                            });
+                            return None;
+                        }
+
+                        let mut actual_params = vec![base_hir];
+
+                        for ((ty, hir), arg) in params_hir.into_iter().zip(proto.arguments.iter()) {
+                            if !self.types_are_same(method_name.loc(), &ty, &arg.ty)? {
+                                self.add_error(
+                                    CheckerError::WrongParamTy {
+                                        param: arg.name.index(),
+                                        expected: arg.ty.clone(),
+                                        received: ty.clone(),
+                                        expr_loc: method_name.0.clone(),
+                                    }
+                                );
+                            }
+                            actual_params.push(hir);
+                        }
+
+                        Some((
+                            (**proto.return_type()).clone(),
+                            HIRExpr::new_call(
+                                HIRCallExpr::new(
+                                    Box::new(HIRExpr::new_global_func(
+                                        name_of_function,
+                                        proto_of_function
+                                    )),
+                                    actual_params,
+                                    self.type_is_aggregate((**proto.return_type()).clone()),
+                                )
+                            )
+                        ))
+                    } else {
+
+                        self.add_error(
+                            CheckerError::MethodNotFoundForAggr {
+                                aggr: name.clone(),
+                                method: method_name.clone(),
+                            }
+                        );
+                        None
+                    }
+                } else {
+                    self.add_error(
+                        CheckerError::NamedTypeNotFound(name.clone())
+                    );
+                    None
+                }
+            } else {
+                // TODO: Calling methods on primitive types
+                todo!("Calling methods on primitive types")
+            }
+        } else {
+            // TODO: Calling methods on primitive types
+            todo!("Calling methods on primitive types")
         }
     }
 
@@ -1614,6 +1894,13 @@ impl Checker {
             hir_cases.push(result.case);
         }
 
+        if !pattern_is_currently_unreachable {
+            // cases were not matched
+            self.add_error(
+                CheckerError::NotAllPatsMatchedForTy(switch.switch_tok().clone(), type_of_value_switched_on)
+            );
+        }
+
         Some((
             Type::Void,
             statement_reachability,
@@ -1797,10 +2084,23 @@ impl Checker {
                 )
             }
             P::DeStructure { name, lkey_tok, fields, ignore, rkey_tok } => {
-                self.pass_destructure(name, lkey_tok, fields.as_slice(), ignore.as_ref(), rkey_tok)
+                self.pass_destructure(name, lkey_tok, fields.as_slice(), ignore.as_ref(), rkey_tok, value_ty)
             }
-            // TODO: Typecheck the rest of the patterns
-            _ => todo!()
+            P::WildCard(mutability, name) => {
+                let value_hir_ty = self.pass_ty(value_ty.clone())?;
+                let is_aggr = value_hir_ty.is_aggr();
+                Some((
+                    HIRPattern::new_wild_card(
+                        value_hir_ty,
+                        is_aggr,
+                        self.collection().unwrap_get(name.index()).to_owned(),
+                    ),
+                    false,
+                    vec![
+                        (name.clone(), value_ty.clone(), mutability.clone())
+                    ]
+                ))
+            }
         }
     }
 
@@ -1863,7 +2163,15 @@ impl Checker {
         fields: &[(Mutability, Identifier, Option<Pattern>)],
         ignore: Option<&Loc>,
         rkey_tok: &Loc,
+        value_ty: &Type,
     ) -> Option<(HIRPattern, bool, Vec<(Identifier, Type, Mutability)>)> {
+        if !self.types_are_same(name.loc(), value_ty, &Type::NamedType(name.clone()))? {
+            self.add_error(CheckerError::InvalidPatForTy {
+                loc: name.loc().clone(),
+                switched_on: value_ty.clone(),
+                pattern_ty: Type::NamedType(name.clone()),
+            })
+        }
         let mut names = vec![];
         let (pattern, reachable) = self.pass_destructure_impl(
             name,
@@ -1871,7 +2179,7 @@ impl Checker {
             fields,
             ignore,
             rkey_tok,
-            &mut names,
+            &mut names
         )?;
         Some((pattern, reachable, names))
     }
@@ -1893,7 +2201,7 @@ impl Checker {
             // if it's an union, we can only match one field at a time
             // if it's a struct, then we don't need so
             let binding = aggr_ty.borrow();
-            let CtxUserType { ty, parent: _ } = &*binding;
+            let CtxUserType { ty, parent: _, methods: _ } = &*binding;
             match ty {
                 UserType::Struct(struct_ty) => {
                     self.handle_struct_destructure(name, struct_ty, fields, ignore, names)
@@ -2227,7 +2535,7 @@ impl Checker {
         let current_return_type = self.ctx.current_function_return_type();
         if let Some(expr) = &ret.expr {
             let (returned_type, _expr_reachability, hir_expr) =
-                self.pass_expr(&expr, ExprState::IsExpr, None)?;
+                self.pass_expr(&expr, ExprState::IsExpr, Some(current_return_type.clone()))?;
 
             if let Type::Pointer { lifetime: Some(_), .. } = &returned_type {
                 self.add_error(
@@ -2723,6 +3031,32 @@ pub enum CheckerError {
     MatchingOnAlias(Identifier),
     /// Unreachable case pattern.
     UnreachableCasePattern(Loc),
+    /// Not all patterns matched for type.
+    NotAllPatsMatchedForTy(Loc, Type),
+    /// Method not found for aggregate type.
+    MethodNotFoundForAggr {
+        aggr: Identifier,
+        method: Identifier,
+    },
+    /// Call method which takes by-value receiver
+    /// on a pointer.
+    CallMethodWhichTakesByValueRecOnPtr {
+        aggr: Identifier,
+        method: Identifier,
+    },
+    /// Invalid type as receiver.
+    InvalidTypeAsReceiver(Identifier, Type),
+    /// Type must be defined at the time
+    /// of definition for receiver.
+    TypeMustBeDefinedAtTimeOfDefinitionForReceiver {
+        function: Identifier,
+        name: Identifier,
+    },
+    /// Method redefiniton for struct.
+    MethodRedefinition {
+        aggr: Identifier,
+        name: Identifier,
+    },
 }
 
 impl CheckerError {
@@ -3125,6 +3459,52 @@ impl CheckerError {
                 format!(
                     "{}Error: [EE052] Case pattern is unreachable",
                     loc_to_string(loc, collection),
+                )
+            }
+            CE::MethodNotFoundForAggr { aggr, method } => {
+                format!(
+                    "{}Error: [EE053] Method '{}' not found in aggregate type '{}'",
+                    loc_to_string(method.loc(), collection),
+                    collection.unwrap_get(method.index()),
+                    collection.unwrap_get(aggr.index()),
+                )
+            }
+            CE::CallMethodWhichTakesByValueRecOnPtr { aggr, method } => {
+                format!(
+                    "{}Error: [EE054] Cannot call method '{}' of aggregate type '{}' which takes receiver by-value on pointer",
+                    loc_to_string(method.loc(), collection),
+                    collection.unwrap_get(method.index()),
+                    collection.unwrap_get(aggr.index()),
+                )
+            }
+            CE::InvalidTypeAsReceiver(name, ty) => {
+                format!(
+                    "{}Error: [EE055] Invalid type as receiver: '{}'",
+                    loc_to_string(name.loc(), collection),
+                    ty_to_string(ty, collection),
+                )
+            }
+            CE::TypeMustBeDefinedAtTimeOfDefinitionForReceiver { function, name } => {
+                format!(
+                    "{}Error: [EE056] Receiver type '{}' of function '{}' must be defined at the time where the function is defined",
+                    loc_to_string(name.loc(), collection),
+                    collection.unwrap_get(name.index()),
+                    collection.unwrap_get(function.index()),
+                )
+            }
+            CE::MethodRedefinition { aggr, name } => {
+                format!(
+                    "{}Error: [EE057] Method redefinition for '{}' of type '{}'",
+                    loc_to_string(name.loc(), collection),
+                    collection.unwrap_get(name.index()),
+                    collection.unwrap_get(aggr.index()),
+                )
+            }
+            CE::NotAllPatsMatchedForTy(loc, ty) => {
+                format!(
+                    "{}Error: [EE058] Not all patterns matched for type '{}' in switch statement",
+                    loc_to_string(loc, collection),
+                    ty_to_string(ty, collection),
                 )
             }
         }).to_string()

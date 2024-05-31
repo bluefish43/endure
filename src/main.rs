@@ -10,6 +10,7 @@ use ast::{
     }, generics::{Generic, Generics}, matcher::{Case, Pattern, Switch}, tdecl::{Struct, TypeDecl, UserType}, typing::{PrimType, Type, TypeBits}, Argument, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, NamespaceDecl, Prototype, Receiver
 };
 use check::Checker;
+use codegen::OptimizationOptions;
 use commands::args::{Solution, Task};
 use either::Either;
 use inkwell::{context::Context, targets::CodeModel, OptimizationLevel};
@@ -72,7 +73,9 @@ async fn main() -> ExitCode {
     let param_name = collection.add("param".to_string());
     let var_name = collection.add("var".to_string());
     let my_struct_name = collection.add("MyStruct".to_string());
+    let my_struct_snake_name = collection.add("my_struct".to_string());
     let my_union_name = collection.add("MyUnion".to_string());
+    let get_unaligned_name = collection.add("get_unaligned".to_string());
     let loc = Loc::new(
         file_name,
         1,
@@ -89,7 +92,7 @@ async fn main() -> ExitCode {
     let my_struct_ty = Type::NamedType(Identifier(loc, my_struct_name));
     let my_union_ty = Type::NamedType(Identifier(loc, my_union_name));
 
-    let mut global = vec![
+    let global = vec![
         Decl::new_type_decl(TypeDecl::new(
             loc,
             Identifier(loc, my_struct_name),
@@ -118,15 +121,185 @@ async fn main() -> ExitCode {
             vec![],
             loc,
             Prototype::new(
+                Some(Receiver::new(
+                    loc,
+                    Identifier(loc, my_struct_snake_name),
+                    loc,
+                    // Box::new(Type::Pointer {
+                    //     pointee: Box::new(my_struct_ty.clone()),
+                    //     mutability: None,
+                    //     lifetime: None,
+                    // }),
+                    Box::new(my_struct_ty.clone()),
+                    loc,
+                )),
+                Identifier(loc, get_unaligned_name),
+                loc,
+                vec![],
+                loc,
+                None,
+                // Box::new(Type::Pointer {
+                //     pointee: Box::new(
+                //         my_union_ty.clone()
+                //     ),
+                //     mutability: None,
+                //     lifetime: None,
+                // }),
+                Box::new(i8_ty.clone()),
+                false
+            ),
+            Block::new(
+                loc,
+                vec![
+                    Expr::Return(ReturnExpr {
+                        ret_kw: loc,
+                        expr: Some(Box::new(
+                            Expr::AccessProperty(
+                                Box::new(Expr::Variable(Identifier(loc, my_struct_snake_name))),
+                                loc,
+                                Identifier(loc, unaligned_field_name),
+                            )
+                        ))
+                    }),
+                ],
+                loc
+            )
+        )),
+        // Decl::new_function_decl(FunctionDecl::new(
+        //     vec![],
+        //     loc,
+        //     Prototype::new(
+        //         None,
+        //         Identifier(loc, main_name),
+        //         loc,
+        //         vec![
+        //         ],
+        //         loc,
+        //         None,
+        //         // Box::new(Type::Pointer {
+        //         //     pointee: Box::new(
+        //         //         my_union_ty.clone()
+        //         //     ),
+        //         //     mutability: None,
+        //         //     lifetime: None,
+        //         // }),
+        //         Box::new(i8_ty.clone()),
+        //         false
+        //     ),
+        //     Block::new(
+        //         loc,
+        //         vec![
+        //             Expr::SlotDecl {
+        //                 mutability: None,
+        //                 name: Identifier(loc, var_name),
+        //                 ty: Type::NamedType(Identifier(loc, my_union_name)),
+        //             },
+        //             Expr::Assignment(AssignmentExpr(BinaryExpr {
+        //                 left_hand_side: Box::new(
+        //                     Expr::AsReference(AsReferenceExpr(loc, Box::new(
+        //                         Expr::Variable(Identifier(loc, var_name))
+        //                     )))
+        //                 ),
+        //                 op: (loc, BinaryOp::Plus),
+        //                 right_hand_side: Either::Left(
+        //                     Box::new(
+        //                         Expr::InstantiateStruct(
+        //                             Identifier(loc, my_union_name),
+        //                             vec![
+        //                                 (Identifier(loc, field_name), Expr::InstantiateStruct(
+        //                                     Identifier(loc, my_struct_name),
+        //                                     vec![
+        //                                         (Identifier(loc, unaligned_field_name), Expr::Literal(LiteralExpr::Int(Type::Primitive {
+        //                                             loc,
+        //                                             ty: PrimType::Int(TypeBits::B64)
+        //                                         }, IntLit(loc, false, 4)))),
+        //                                         (Identifier(loc, field_name), Expr::Literal(LiteralExpr::Int(Type::Primitive {
+        //                                             loc,
+        //                                             ty: PrimType::Int(TypeBits::B64)
+        //                                         }, IntLit(loc, false, 300))))
+        //                                     ]
+        //                                 ))
+        //                             ]
+        //                         )
+        //                     )
+        //                 )
+        //             })),
+        //             Expr::Switch(Switch {
+        //                 switch_tok: loc,
+        //                 value: Box::new(
+        //                     Expr::Variable(Identifier(loc, var_name)),
+        //                 ),
+        //                 rkey_tok: loc,
+        //                 lkey_tok: loc,
+        //                 patterns: vec![
+        //                     Case::new(
+        //                         loc,
+        //                         Pattern::DeStructure {
+        //                             name: Identifier(loc, my_union_name),
+        //                             lkey_tok: loc,
+        //                             fields: vec![
+        //                                 (
+        //                                     None,
+        //                                     Identifier(loc, field_name),
+        //                                     None,
+        //                                 ),
+        //                             ],
+        //                             ignore: None,
+        //                             rkey_tok: loc,
+        //                         },
+        //                         Block::new(
+        //                             loc,
+        //                             vec![
+        //                                 Expr::Return(ReturnExpr {
+        //                                     ret_kw: loc,
+        //                                     expr: Some(Box::new(
+        //                                         Expr::MethodCall {
+        //                                             base: Box::new(
+        //                                                 Expr::Variable(
+        //                                                     Identifier(loc, field_name)
+        //                                                 )
+        //                                             ),
+        //                                             name: Identifier(loc, get_unaligned_name),
+        //                                             params: vec![],
+        //                                         }
+        //                                     ))
+        //                                 })
+        //                             ],
+        //                             loc,
+        //                         ),
+        //                     )
+        //                 ]
+        //             }),
+        //             // Expr::Return(ReturnExpr {
+        //             //     ret_kw: loc,
+        //             //     expr: Some(Box::new(
+        //             //         Expr::MethodCall {
+        //             //             base: Box::new(
+        //             //                 Expr::AccessProperty(
+        //             //                     Box::new(Expr::Variable(
+        //             //                         Identifier(loc, var_name)
+        //             //                     )),
+        //             //                     loc,
+        //             //                     Identifier(loc, field_name),
+        //             //                 )
+        //             //             ),
+        //             //             name: Identifier(loc, get_unaligned_name),
+        //             //             params: vec![],
+        //             //         }
+        //             //     ))
+        //             // })
+        //         ],
+        //         loc
+        //     )
+        // )),
+        Decl::new_function_decl(FunctionDecl::new(
+            vec![],
+            loc,
+            Prototype::new(
                 None,
                 Identifier(loc, main_name),
                 loc,
                 vec![
-                    Argument::new(
-                        Identifier(loc, param_name),
-                        my_struct_ty.clone(),
-                        None
-                    )
                 ],
                 loc,
                 None,
@@ -137,7 +310,7 @@ async fn main() -> ExitCode {
                 //     mutability: None,
                 //     lifetime: None,
                 // }),
-                Box::new(my_struct_ty.clone()),
+                Box::new(i8_ty.clone()),
                 false
             ),
             Block::new(
@@ -146,7 +319,7 @@ async fn main() -> ExitCode {
                     Expr::SlotDecl {
                         mutability: None,
                         name: Identifier(loc, var_name),
-                        ty: Type::NamedType(Identifier(loc, my_union_name)),
+                        ty: i8_ty.clone(),
                     },
                     Expr::Assignment(AssignmentExpr(BinaryExpr {
                         left_hand_side: Box::new(
@@ -157,12 +330,10 @@ async fn main() -> ExitCode {
                         op: (loc, BinaryOp::Plus),
                         right_hand_side: Either::Left(
                             Box::new(
-                                Expr::InstantiateStruct(
-                                    Identifier(loc, my_union_name),
-                                    vec![
-                                        (Identifier(loc, field_name), Expr::Variable(Identifier(loc, param_name)))
-                                    ]
-                                )
+                                Expr::Literal(LiteralExpr::Int(Type::Primitive {
+                                    loc,
+                                    ty: PrimType::Int(TypeBits::B64)
+                                }, IntLit(loc, false, 4)))
                             )
                         )
                     })),
@@ -176,28 +347,65 @@ async fn main() -> ExitCode {
                         patterns: vec![
                             Case::new(
                                 loc,
-                                Pattern::DeStructure {
-                                    name: Identifier(loc, my_union_name),
-                                    lkey_tok: loc,
-                                    fields: vec![
-                                        (
-                                            None,
-                                            Identifier(loc, field_name),
-                                            None,
-                                        ),
-                                    ],
-                                    ignore: None,
-                                    rkey_tok: loc,
-                                },
+                                Pattern::Literal(
+                                    LiteralExpr::Int(Type::Primitive {
+                                        loc,
+                                        ty: PrimType::Int(TypeBits::B64)
+                                    }, IntLit(loc, false, 5))
+                                ),
                                 Block::new(
                                     loc,
                                     vec![
                                         Expr::Return(ReturnExpr {
                                             ret_kw: loc,
-                                            expr: Some(Box::new(
-                                                Expr::Variable(
-                                                    Identifier(loc, field_name)
-                                                )
+                                            expr: Some(Box::new(Expr::Literal(
+                                                LiteralExpr::Int(Type::Primitive {
+                                                    loc,
+                                                    ty: PrimType::Int(TypeBits::B64)
+                                                }, IntLit(loc, false, 50)))
+                                            ))
+                                        })
+                                    ],
+                                    loc,
+                                ),
+                            ),
+                            Case::new(
+                                loc,
+                                Pattern::Literal(
+                                    LiteralExpr::Int(Type::Primitive {
+                                        loc,
+                                        ty: PrimType::Int(TypeBits::B64)
+                                    }, IntLit(loc, false, 3))
+                                ),
+                                Block::new(
+                                    loc,
+                                    vec![
+                                        Expr::Return(ReturnExpr {
+                                            ret_kw: loc,
+                                            expr: Some(Box::new(Expr::Literal(
+                                                LiteralExpr::Int(Type::Primitive {
+                                                    loc,
+                                                    ty: PrimType::Int(TypeBits::B64)
+                                                }, IntLit(loc, false, 30)))
+                                            ))
+                                        })
+                                    ],
+                                    loc,
+                                ),
+                            ),
+                            Case::new(
+                                loc,
+                                Pattern::WildCard(None, Identifier(loc, field_name)),
+                                Block::new(
+                                    loc,
+                                    vec![
+                                        Expr::Return(ReturnExpr {
+                                            ret_kw: loc,
+                                            expr: Some(Box::new(Expr::Literal(
+                                                LiteralExpr::Int(Type::Primitive {
+                                                    loc,
+                                                    ty: PrimType::Int(TypeBits::B64)
+                                                }, IntLit(loc, false, 40)))
                                             ))
                                         })
                                     ],
@@ -209,16 +417,21 @@ async fn main() -> ExitCode {
                     // Expr::Return(ReturnExpr {
                     //     ret_kw: loc,
                     //     expr: Some(Box::new(
-                    //         Expr::AsReference(
-                    //             AsReferenceExpr(
-                    //                 loc,
-                    //                 Box::new(Expr::Variable(
-                    //                     Identifier(loc, var_name)
-                    //                 ))
-                    //             )
-                    //         )
+                    //         Expr::MethodCall {
+                    //             base: Box::new(
+                    //                 Expr::AccessProperty(
+                    //                     Box::new(Expr::Variable(
+                    //                         Identifier(loc, var_name)
+                    //                     )),
+                    //                     loc,
+                    //                     Identifier(loc, field_name),
+                    //                 )
+                    //             ),
+                    //             name: Identifier(loc, get_unaligned_name),
+                    //             params: vec![],
+                    //         }
                     //     ))
-                    // }),
+                    // })
                 ],
                 loc
             )
@@ -229,6 +442,7 @@ async fn main() -> ExitCode {
     checker.collect(&global);
 
     let hir_decls = checker.pass_program(&global);
+    dbg!(&hir_decls);
 
     let errors = checker.errors();
     let warnings = checker.warnings();
@@ -270,12 +484,12 @@ async fn main() -> ExitCode {
                 use_pie: false,
                 code_model: CodeModel::Medium,
                 triple: None,
+                opts: OptimizationOptions::default(),
             }))) as *mut Emmitter;
             let reference = generator.as_mut().unwrap();
             reference.emmit_program(&hir_decls.as_slice());
 
             report_state("Generating output file... ");
-            std::thread::sleep(Duration::from_millis(500));
 
             match reference.export() {
                 Ok(_) => {
