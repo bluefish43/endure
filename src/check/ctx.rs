@@ -397,6 +397,7 @@ impl Context {
                         }
                     }
                     None => {
+                        // FIXME: Bug here when looking up for variant (for some reason)
                         errors.push(CheckerError::MemberNotFound(at.clone(), right_name.index()));
                         return Either::Right(errors);
                     }

@@ -25,7 +25,7 @@ mod namespaces;
 mod scopes;
 
 use std::{
-    cell::RefCell, collections::HashMap, ops::{BitAnd, BitAndAssign}, rc::Rc
+    cell::{Ref, RefCell}, collections::HashMap, ops::{BitAnd, BitAndAssign}, rc::Rc
 };
 
 use ansi_term::Color;
@@ -38,7 +38,7 @@ use crate::{
         expr::{
             AsReferenceExpr, AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Conditional,
             Expr, LiteralExpr, ReturnExpr, WhileLoop,
-        }, generics::Generic, matcher::{Case, Pattern, Switch}, tdecl::{Struct, TypeDecl, UserType}, typing::{NameIndex, PrimType, Type, TypeBits}, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, Mutability, NamespaceDecl, Prototype, Receiver
+        }, generics::Generic, matcher::{Case, Pattern, Switch}, tdecl::{Struct, SumVariant, TypeDecl, UserType}, typing::{NameIndex, PrimType, Type, TypeBits}, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, Mutability, NamespaceDecl, Prototype, Receiver
     },
     check::{hir::{expr::HIRLiteralExpr, HIRArgument}, namespaces::Member},
 };
@@ -489,7 +489,53 @@ impl Checker {
                         self.pass_ty(field_ty.clone());
                     }
                 }
-            },
+            }
+            UserType::Sum(sum_ty) => {
+                // store info about the discriminants
+                let mut appeared_discriminants: Vec<(u64, Identifier)> = vec![];
+
+                for SumVariant {
+                    parent,
+                    name,
+                    discriminant,
+                    aggregate_fields
+                } in sum_ty {
+                    // check for discriminant index repetition
+                    let discr_value = discriminant.2;
+                    if let Some((_, before)) = appeared_discriminants.iter().find(|value| value.0 == discr_value) {
+                        // index repeated
+                        self.add_error(
+                            CheckerError::RepeatedSumTyDiscriminant {
+                                sum_ty: parent.clone(),
+                                variant: name.clone(),
+                                before: before.clone(),
+                                discriminant: discr_value,
+                            }
+                        );
+                    } else {
+                        appeared_discriminants.push((discr_value, name.clone()));
+                    }
+
+                    if let Some(fields) = aggregate_fields {
+                        // check its fields now, if any
+                        let mut occurred_fields = vec![];
+                        for (field_name, field_ty) in fields.fields().iter() {
+                            if occurred_fields.contains(&field_name.index()) {
+                                self.add_error(
+                                    CheckerError::StructFieldRedefinition {
+                                        name: name.clone(),
+                                        field: field_name.clone(),
+                                        for_: "sum type variant",
+                                    }
+                                );
+                            } else {
+                                occurred_fields.push(field_name.index());
+                                self.pass_ty(field_ty.clone());
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -672,13 +718,34 @@ impl Checker {
                             self.pass_ty(to.clone())
                         }
                         UserType::Struct(Struct { fields }) => {
-                            let mut hir_fields = Vec::with_capacity(fields.len());
+                            self.struct_hir_ty_from_fields(fields)
+                        }
+                        UserType::Sum(sum_ty) => {
+                            let mut union_fields = vec![];
+                            for variant in sum_ty.iter() {
+                                match variant.aggregate_fields() {
+                                    Some(sum_fields) => {
+                                        // add this variant
+                                        let mut hir_fields = Vec::with_capacity(sum_fields.fields().len());
 
-                            for (_, field_ty) in fields.iter(){ 
-                                hir_fields.push(self.pass_ty(field_ty.clone())?);
+                                        for (_, field_ty) in sum_fields.fields().iter(){ 
+                                            hir_fields.push(self.pass_ty(field_ty.clone())?);
+                                        }
+
+                                        union_fields.push(HIRType::Struct(hir_fields).into_aligned(std::mem::size_of::<usize>()));
+                                    }
+                                    None => {},
+                                }
                             }
 
-                            Some(HIRType::Struct(hir_fields).into_aligned(std::mem::size_of::<usize>()))
+                            let discriminant_type = HIRType::new_primitive(
+                                Loc::default(),
+                                PrimType::UInt(TypeBits::B64),
+                            );
+                            Some(HIRType::new_sum_type(
+                                Box::new(discriminant_type),
+                                union_fields,
+                            ))
                         }
                         UserType::Union(fields) => {
                             let mut hir_fields = Vec::with_capacity(fields.len());
@@ -703,6 +770,22 @@ impl Checker {
                 unimplemented!()
             }
         }
+    }
+
+    /// Converts a struct type into its HIR equivalent from its fields.
+    fn struct_hir_ty_from_fields(&mut self, fields: &[(Identifier, Type)]) -> Option<HIRType> {
+        let mut hir_fields = Vec::with_capacity(fields.len());
+
+        for (_, field_ty) in fields.iter(){ 
+            hir_fields.push(self.pass_ty(field_ty.clone())?);
+        }
+
+        Some(HIRType::Struct(hir_fields).into_aligned(std::mem::size_of::<usize>()))
+    }
+
+    /// Converts a struct type into its HIR equivalent from its fields.
+    fn struct_hir_ty_from_hir_fields(&mut self, fields: &[HIRType]) -> Option<HIRType> {
+        Some(HIRType::Struct(fields.to_vec()).into_aligned(std::mem::size_of::<usize>()))
     }
 
     /// Passes through an expression which gives out
@@ -1192,68 +1275,13 @@ impl Checker {
                 UserType::Struct(Struct { fields }) => {
                     let struct_ty = self.pass_ty(Type::NamedType(struct_name.clone()))?;
 
-                    if expr_fields.len() != fields.len() {
-                        self.add_error(CheckerError::WrongFieldNumberForStruct {
-                            name: struct_name.clone(),
-                            received: expr_fields.len(),
-                            needed: fields.len(),
-                        });
-
-                        None
-                    } else {
-                        // check for each field
-                        let mut hir_fields = Vec::new();
-
-                        for (_, field) in fields.iter().enumerate() {
-                            if let Some((spec_name, field_expr)) = expr_fields.iter().find(|(name, _)| name == &field.0) {
-                                // number of expressions for field
-                                let provided_exprs_for_field = expr_fields.iter().filter(|value| &value.0 == spec_name).count();
-                                
-                                // check if repeated
-                                if provided_exprs_for_field != 1 {
-                                    self.add_error(CheckerError::RepeatedFieldInInstantiation {
-                                        field: field.0.clone(),
-                                        provided: provided_exprs_for_field,
-                                    });
-                                    
-                                    return None;
-                                }
-                                
-                                // pass field expr
-                                let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(field_expr, ExprState::IsExpr, Some(field.1.clone()))?;
-
-                                if !self.types_are_same(spec_name.loc(), &spec_field_ty, &field.1)? {
-                                    self.add_error(CheckerError::WrongTyForField {
-                                        struct_name: struct_name.clone(),
-                                        field_name: field.0.clone(),
-                                        supplied_ty: spec_field_ty.clone(),
-                                        expected_ty: field.1.clone(),
-                                        instantiating: "struct",
-                                    })
-                                }
-                                
-                                hir_fields.push((spec_field_hir, self.type_is_aggregate(spec_field_ty)));
-                            } else {
-                                self.add_error(CheckerError::FieldNotProvidedWhenInstantiating {
-                                    struct_name: struct_name.clone(),
-                                    field: field.0.clone(),
-                                    ty: field.1.clone(),
-                                });
-
-                                return None
-                            }
-                        }
-
-                        // implement here
-
-                        Some((
-                            Type::new_named_type(struct_name.clone()),
-                            HIRExpr::new_instantiate_struct(
-                                struct_ty,
-                                hir_fields,
-                            )
-                        ))
-                    }
+                    self.pass_instantiate_struct_impl(
+                        struct_name,
+                        struct_name,
+                        struct_ty,
+                        expr_fields,
+                        fields
+                    )
                 }
                 UserType::Union(fields) => {
                     let union_ty = self.pass_ty(Type::NamedType(struct_name.clone()))?;
@@ -1320,6 +1348,93 @@ impl Checker {
         }
     }
 
+    fn pass_instantiate_struct_impl(
+        &mut self,
+        struct_name: &Identifier,
+        debug_name: &Identifier,
+        struct_ty: HIRType,
+        expr_fields: &[(Identifier, Expr)],
+        fields: &[(Identifier, Type)]
+    ) -> Option<(Type, HIRExpr)> {
+        if expr_fields.len() != fields.len() {
+            self.add_error(CheckerError::WrongFieldNumberForStruct {
+                name: debug_name.clone(),
+                received: expr_fields.len(),
+                needed: fields.len(),
+            });
+
+            None
+        } else {
+            // check for each field
+            let mut hir_fields = Vec::new();
+
+            for (_, field) in fields.iter().enumerate() {
+                if let Some((spec_name, field_expr)) = expr_fields.iter().find(|(name, _)| name == &field.0) {
+                    // number of expressions for field
+                    let provided_exprs_for_field = expr_fields.iter().filter(|value| &value.0 == spec_name).count();
+                    
+                    // check if repeated
+                    if provided_exprs_for_field != 1 {
+                        self.add_error(CheckerError::RepeatedFieldInInstantiation {
+                            field: field.0.clone(),
+                            provided: provided_exprs_for_field,
+                        });
+                        
+                        return None;
+                    }
+                    
+                    // pass field expr
+                    let (spec_field_ty, spec_field_hir) = self.pass_reachable_expr(field_expr, ExprState::IsExpr, Some(field.1.clone()))?;
+
+                    if !self.types_are_same(spec_name.loc(), &spec_field_ty, &field.1)? {
+                        self.add_error(CheckerError::WrongTyForField {
+                            struct_name: debug_name.clone(),
+                            field_name: field.0.clone(),
+                            supplied_ty: spec_field_ty.clone(),
+                            expected_ty: field.1.clone(),
+                            instantiating: "struct",
+                        })
+                    }
+                    
+                    hir_fields.push((spec_field_hir, self.type_is_aggregate(spec_field_ty)));
+                } else {
+                    self.add_error(CheckerError::FieldNotProvidedWhenInstantiating {
+                        struct_name: debug_name.clone(),
+                        field: field.0.clone(),
+                        ty: field.1.clone(),
+                    });
+
+                    return None
+                }
+            }
+
+            // implement here
+
+            Some((
+                Type::new_named_type(struct_name.clone()),
+                HIRExpr::new_instantiate_struct(
+                    struct_ty,
+                    hir_fields,
+                )
+            ))
+        }
+    }
+
+    fn pass_instantiate_struct_impl_hir(
+        &mut self,
+        struct_name: &Identifier,
+        struct_ty: HIRType,
+        hir_fields: Vec<(HIRExpr, Option<HIRType>)>,
+    ) -> Option<(Type, HIRExpr)> {
+        Some((
+            Type::new_named_type(struct_name.clone()),
+            HIRExpr::new_instantiate_struct(
+                struct_ty,
+                hir_fields,
+            )
+        ))
+    }
+
     /// Validates a binary expression.
     fn pass_bin_expr(
         &mut self,
@@ -1365,6 +1480,17 @@ impl Checker {
         dot: Loc,
         prop: &Identifier,
     ) -> Option<(Type, HIRExpr, Option<usize>)> {
+        // check if this is sum type instantiation as in Result.Ok without arguments
+        if let Expr::Variable(possible_sum_ty) = base {
+            if let Some(Member::Type(user_ty)) = self.ctx.lookup_member(&possible_sum_ty.1) {
+                let borrowed = user_ty.borrow();
+                if let CtxUserType { ty: UserType::Sum(variants), .. } = &*borrowed {
+                    return self.pass_instantiate_sum(possible_sum_ty, prop, None, variants)
+                        .map(|value| (value.0, value.1, None))
+                }
+            }
+        }
+
         let (base_ty, base_val) = self.pass_reachable_expr(base, ExprState::IsExpr, None)?;
 
         let hir_ty = self.pass_ty(base_ty.clone())?;
@@ -1452,7 +1578,19 @@ impl Checker {
     }
 
     /// Validates the calling of a method.
+    /// 
+    /// It can also be the instantiation of a sum variant.
     fn pass_method_call(&mut self, base: &Expr, method_name: &Identifier, params: &[Expr]) -> Option<(Type, HIRExpr)> {
+        // check if this is sum type instantiation as in Result.Ok(...args)
+        if let Expr::Variable(possible_sum_ty) = base {
+            if let Some(Member::Type(user_ty)) = self.ctx.lookup_member(&possible_sum_ty.1) {
+                let borrowed = user_ty.borrow();
+                if let CtxUserType { ty: UserType::Sum(variants), .. } = &*borrowed {
+                    return self.pass_instantiate_sum(possible_sum_ty, method_name, Some(params), variants)
+                }
+            }
+        }
+
         // get the type and HIR for base
         let (base_ty, base_hir) = self.pass_reachable_expr(base, ExprState::IsExpr, None)?;
         
@@ -1639,6 +1777,132 @@ impl Checker {
             // TODO: Calling methods on primitive types
             todo!("Calling methods on primitive types")
         }
+    }
+
+    /// Passes through the instantiation of a sum type.
+    fn pass_instantiate_sum(
+        &mut self,
+        sum_name: &Identifier,
+        variant_name: &Identifier,
+        params: Option<&[Expr]>,
+        variants: &[SumVariant]
+    ) -> Option<(Type, HIRExpr)> {
+        let mut variant_fields = vec![];
+        for variant in variants {
+            if let Some(sum_fields) = &variant.aggregate_fields {
+                let mut new_fields = vec![];
+                for (field, ty) in sum_fields.fields().iter() {
+                    new_fields.push((field.clone(), ty.clone()));
+                }
+                variant_fields.push(self.struct_hir_ty_from_fields(
+                    &new_fields
+                )?);
+            }
+        }
+
+        // get the hir type of the sum
+        let mut sum_fields = vec![HIRType::Primitive {
+            loc: Loc::default(),
+            ty: PrimType::UInt(TypeBits::B64),
+        }];
+        let mut actual_fields = vec![];
+        if !variant_fields.is_empty() {
+            actual_fields.push(HIRType::Union(variant_fields));
+        }
+        sum_fields.extend(actual_fields.clone().into_iter());
+        let sum_type_hir = self.struct_hir_ty_from_hir_fields(
+            &sum_fields
+        )?;
+
+        for variant in variants {
+            // check if the name is equal
+            if variant.name() == variant_name {
+                // get its d
+                let discriminant = variant.discriminant.2;
+                let (_, discriminant_hir) = self.pass_lit_expr(
+                    &LiteralExpr::Int(
+                        Type::new_primitive(
+                            Loc::default(),
+                            PrimType::Int(TypeBits::B64),
+                        ),
+                        IntLit(Loc::default(), false, discriminant)
+                    ),
+                    Some(Type::new_primitive(
+                        Loc::default(),
+                        PrimType::Int(TypeBits::B64),
+                    ))
+                )?;
+                // get everything correctly
+                if variant.aggregate_fields.is_none() && params.is_some() {
+                    self.add_error(
+                        CheckerError::VariantDoesntTakeFields {
+                            sum: sum_name.clone(),
+                            variant: variant_name.clone(),
+                        }
+                    );
+                    return None;
+                } else if variant.aggregate_fields.is_some() && params.is_none() {
+                    self.add_error(
+                        CheckerError::VariantTakeFieldsButNotFound {
+                            sum: sum_name.clone(),
+                            variant: variant_name.clone(),
+                        }
+                    );
+                    return None;
+                } else {
+                    // typecheck the fields if any
+                    return match (params, variant.aggregate_fields()) {
+                        (Some(params), Some(fields)) => {
+                            let fields_struct_ty = self.struct_hir_ty_from_hir_fields(
+                                &actual_fields
+                            )?;
+                            let sum_struct_ty = self.struct_hir_ty_from_hir_fields(
+                                &sum_fields
+                            )?;
+
+                            let mut new_fields = vec![];
+                            for (field, expr) in fields.fields().iter().zip(params.iter()) {
+                                new_fields.push((field.0.clone(), expr.clone()));
+                            }
+                            let (_sum_fields_ty, sum_fields_hir) = self.pass_instantiate_struct_impl(
+                                sum_name,
+                                variant_name,
+                                fields_struct_ty,
+                                &new_fields,
+                                &fields.fields()
+                            )?;
+                            self.pass_instantiate_struct_impl_hir(
+                                sum_name,
+                                sum_struct_ty.clone(),
+                                vec![
+                                    (discriminant_hir, None),
+                                    (sum_fields_hir, Some(sum_struct_ty)),
+                                ]
+                            )
+                        }
+                        _ => {
+                            Some((
+                                Type::NamedType(sum_name.clone()),
+                                HIRExpr::new_instantiate_struct(
+                                    sum_type_hir,
+                                    vec![(discriminant_hir, None)]
+                                )
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+
+        // sum variant not found within
+        self.add_error(
+            CheckerError::NoSuchSumVariant {
+                sum: sum_name.clone(),
+                variant: variant_name.clone(),
+            }
+        );
+
+        None
     }
 
     /// Validates the instantiation of a generic.
@@ -2226,6 +2490,12 @@ impl Checker {
                     }
 
                     self.handle_union_destructure(name, &union_ty, fields.first().unwrap(), names)
+                }
+                UserType::Sum(_) => {
+                    self.add_error(
+                        CheckerError::MustSpecifyVariantDestructSumTy(name.clone()),
+                    );
+                    None
                 }
                 UserType::Alias(_) => {
                     self.add_error(
@@ -3057,6 +3327,34 @@ pub enum CheckerError {
         aggr: Identifier,
         name: Identifier,
     },
+    /// Must specify variant when destructuring a
+    /// sum type.
+    MustSpecifyVariantDestructSumTy(Identifier),
+    /// The index of the discriminant has already
+    /// appeared before.
+    RepeatedSumTyDiscriminant {
+        sum_ty: Identifier,
+        variant: Identifier,
+        before: Identifier,
+        discriminant: u64,
+    },
+    /// No such sum type variant.
+    NoSuchSumVariant {
+        sum: Identifier,
+        variant: Identifier,
+    },
+    /// The sum type does not take
+    /// variants.
+    VariantDoesntTakeFields {
+        sum: Identifier,
+        variant: Identifier
+    },
+    /// The sum type takes fields but they
+    /// were not specified.
+    VariantTakeFieldsButNotFound {
+        sum: Identifier,
+        variant: Identifier
+    },
 }
 
 impl CheckerError {
@@ -3505,6 +3803,46 @@ impl CheckerError {
                     "{}Error: [EE058] Not all patterns matched for type '{}' in switch statement",
                     loc_to_string(loc, collection),
                     ty_to_string(ty, collection),
+                )
+            }
+            CE::MustSpecifyVariantDestructSumTy(loc) => {
+                format!(
+                    "{}Error: [EE059] Must specify a variant when destructing a sum type",
+                    loc_to_string(loc.loc(), collection),
+                )
+            }
+            CE::RepeatedSumTyDiscriminant { sum_ty, variant, before, discriminant } => {
+                format!(
+                    "{}Error: [EE060] The discriminant '{}' previously used by the variant '{}' was used again by a variant named '{}' in the sum type '{}', which is not allowed",
+                    loc_to_string(variant.loc(), collection),
+                    discriminant,
+                    collection.unwrap_get(before.index()),
+                    collection.unwrap_get(variant.index()),
+                    collection.unwrap_get(sum_ty.index()),
+                )
+            }
+            CE::NoSuchSumVariant { sum, variant } => {
+                format!(
+                    "{}Error: [EE061] The variant '{}' does not exist within the sum type '{}'",
+                    loc_to_string(variant.loc(), collection),
+                    collection.unwrap_get(variant.index()),
+                    collection.unwrap_get(sum.index()),
+                )
+            }
+            CE::VariantDoesntTakeFields { sum, variant } => {
+                format!(
+                    "{}Error: [EE062] The variant '{}' of the sum type '{}' does not take fields",
+                    loc_to_string(variant.loc(), collection),
+                    collection.unwrap_get(variant.index()),
+                    collection.unwrap_get(sum.index()),
+                )
+            }
+            CE::VariantTakeFieldsButNotFound { sum, variant } => {
+                format!(
+                    "{}Error: [EE063] The variant '{}' of the sum type '{}' takes fields but none were found",
+                    loc_to_string(variant.loc(), collection),
+                    collection.unwrap_get(variant.index()),
+                    collection.unwrap_get(sum.index()),
                 )
             }
         }).to_string()

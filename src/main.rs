@@ -7,7 +7,7 @@ use ast::{
     expr::{
         AsReferenceExpr, AssignmentExpr, BinaryExpr, BinaryOp, CallExpr, Expr, LiteralExpr,
         ReturnExpr,
-    }, generics::{Generic, Generics}, matcher::{Case, Pattern, Switch}, tdecl::{Struct, TypeDecl, UserType}, typing::{PrimType, Type, TypeBits}, Argument, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, NamespaceDecl, Prototype, Receiver
+    }, generics::{Generic, Generics}, matcher::{Case, Pattern, Switch}, tdecl::{Struct, SumFields, SumVariant, TypeDecl, UserType}, typing::{PrimType, Type, TypeBits}, Argument, Block, Collection, Decl, FunctionDecl, Identifier, IntLit, Loc, NamespaceDecl, Prototype, Receiver
 };
 use check::Checker;
 use codegen::OptimizationOptions;
@@ -72,9 +72,12 @@ async fn main() -> ExitCode {
     let field_name = collection.add("field".to_string());
     let param_name = collection.add("param".to_string());
     let var_name = collection.add("var".to_string());
+    let other_var_name = collection.add("other_var".to_string());
     let my_struct_name = collection.add("MyStruct".to_string());
     let my_struct_snake_name = collection.add("my_struct".to_string());
     let my_union_name = collection.add("MyUnion".to_string());
+    let my_sum_name = collection.add("MySum".to_string());
+    let my_variant_name = collection.add("MyVariant".to_string());
     let get_unaligned_name = collection.add("get_unaligned".to_string());
     let loc = Loc::new(
         file_name,
@@ -91,6 +94,7 @@ async fn main() -> ExitCode {
     };
     let my_struct_ty = Type::NamedType(Identifier(loc, my_struct_name));
     let my_union_ty = Type::NamedType(Identifier(loc, my_union_name));
+    let my_sum_ty = Type::NamedType(Identifier(loc, my_sum_name));
 
     let global = vec![
         Decl::new_type_decl(TypeDecl::new(
@@ -114,6 +118,27 @@ async fn main() -> ExitCode {
                 vec![
                     (Identifier(loc, unaligned_field_name), i8_ty.clone()),
                     (Identifier(loc, field_name), my_struct_ty.clone()),
+                ]
+            )
+        )),
+        Decl::new_type_decl(TypeDecl::new(
+            loc,
+            Identifier(loc, my_sum_name),
+            loc,
+            UserType::Sum(
+                vec![
+                    SumVariant::new(
+                        Identifier(loc, my_sum_name),
+                        Identifier(loc, my_variant_name),
+                        IntLit(loc, false, 0),
+                        Some(SumFields::new(
+                            loc,
+                            vec![
+                                (Identifier(loc, field_name), i8_ty.clone())
+                            ],
+                            loc
+                        ))
+                    ) 
                 ]
             )
         )),
@@ -337,6 +362,30 @@ async fn main() -> ExitCode {
                             )
                         )
                     })),
+                    Expr::SlotDecl {
+                        mutability: None,
+                        name: Identifier(loc, other_var_name),
+                        ty: my_sum_ty.clone(),
+                    },
+                    Expr::Assignment(AssignmentExpr(BinaryExpr {
+                        left_hand_side: Box::new(
+                            Expr::AsReference(AsReferenceExpr(loc, Box::new(
+                                Expr::Variable(Identifier(loc, other_var_name))
+                            )))
+                        ),
+                        op: (loc, BinaryOp::Plus),
+                        right_hand_side: Either::Left(
+                            Box::new(
+                                Expr::MethodCall {
+                                    base: Box::new(Expr::Variable(Identifier(loc, my_sum_name))),
+                                    name: Identifier(loc, my_variant_name),
+                                    params: vec![
+                                        Expr::Variable(Identifier(loc, var_name)),
+                                    ]
+                                }
+                            )
+                        )
+                    })),
                     Expr::Switch(Switch {
                         switch_tok: loc,
                         value: Box::new(
@@ -442,7 +491,7 @@ async fn main() -> ExitCode {
     checker.collect(&global);
 
     let hir_decls = checker.pass_program(&global);
-    dbg!(&hir_decls);
+    // dbg!(&hir_decls);
 
     let errors = checker.errors();
     let warnings = checker.warnings();

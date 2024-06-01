@@ -541,7 +541,7 @@ impl<'c> Emmitter<'c> {
 
         // if returns aggregate, use void and take
         // return parameter instead
-        let return_type = if let HIRType::AlignedStruct(_) | HIRType::Union(_) = &**proto.return_type() {
+        let return_type = if proto.return_type().is_aggr() {
             args.push(
                 self.context()
                     .i32_type()
@@ -630,8 +630,29 @@ impl<'c> Emmitter<'c> {
                     )
                     .as_any_type_enum()
             }
+            HT::SumType { discriminant, variants } => {
+                // get the type of the discriminant
+                let discriminant = basic_type(self.llvm_type(&discriminant));
+                // get the union of its contents
+                let size_of_self = ty.size(false);
+                // return opaque type
+                let inner_union = self.context()
+                    .i8_type()
+                    .array_type(size_of_self as u32)
+                    .as_basic_type_enum();
+                // return a struct of the sum
+                self.context()
+                    .struct_type(
+                        &[
+                            discriminant,
+                            inner_union
+                        ],
+                        false
+                    )
+                    .as_any_type_enum()
+            }
             HT::Union(_) => {
-                let size_of_self = ty.size();
+                let size_of_self = ty.size(true);
                 // return opaque type
                 self.context()
                     .i8_type()
@@ -1025,51 +1046,64 @@ impl<'c> Emmitter<'c> {
         uni_mem.as_any_value_enum()
     }
 
-    /// Emmits the instantiation of a struct.
+    /// Emits the instantiation of a struct.
     fn emmit_instantiate_struct(&'c self, hir_stct_ty: &HIRType, fields: &[(HIRExpr, Option<HIRType>)], aggr_ptr: Option<PointerValue<'c>>) -> AnyValueEnum<'c> {
         let stct_ty = basic_type(self.llvm_type(hir_stct_ty));
-        // allocate memory for the struct
-        let stct_mem = if let Some(aggr_ptr) = aggr_ptr {
-            aggr_ptr
-        } else {
-            self.builder()
-                .build_alloca(stct_ty, "instantiated struct")
-                .unwrap()
-        };
+        let stct_mem = self.allocate_struct_memory(stct_ty, aggr_ptr);
+
         if let HIRType::AlignedStruct(aligned_fields) = hir_stct_ty {
-            // set the values of the structs
             for (index, field) in fields.iter().enumerate() {
-                let field_is_aggr = field.1.as_ref().map(|t| t.is_aggr()).unwrap_or_default();
-                let actual_index = index_aligned(
-                    aligned_fields.iter(),
-                    index as u32
-                );
-                let field_address = self.builder()
-                    .build_struct_gep(
-                        stct_ty,
-                        stct_mem,
-                        actual_index as u32,
-                        "address of field"
-                    )
-                    .unwrap();
-                if field_is_aggr {
-                    // if it is aggregate, instantiate it directly
-                    // get size of type
-                    self.emmit_expr_impl(&field.0, false, Some(field_address));
-                } else {
-                    let field_value = basic_value(self.emmit_expr(&field.0));
-                    // otherwise just store it
-                    self.builder()
-                        .build_store(
-                            field_address,
-                            field_value
-                        )
-                        .unwrap();
-                }
+                // Calculate the actual memory index considering alignment and padding
+                let actual_index = index_aligned(aligned_fields.iter(), index as u32);
+
+                // Get the address for the field within the struct
+                let field_address = self.get_struct_field_address(stct_ty, stct_mem, actual_index);
+
+                // Assign the field value, handling aggregates in-place
+                self.assign_field_value(field, field_address);
             }
             stct_mem.as_any_value_enum()
         } else {
-            unreachable!("Instantiating non-aligned struct type")
+            unreachable!("Instantiating non-aligned struct type: {:?}", hir_stct_ty)
+        }
+    }
+
+    /// Allocates memory for the struct.
+    fn allocate_struct_memory(
+        &'c self,
+        stct_ty: BasicTypeEnum<'c>,
+        aggr_ptr: Option<PointerValue<'c>>
+    ) -> PointerValue<'c> {
+        aggr_ptr.unwrap_or_else(|| {
+            self.builder()
+                .build_alloca(stct_ty, "instantiated struct")
+                .unwrap()
+        })
+    }
+
+    /// Gets the address of a field within the struct.
+    fn get_struct_field_address(&'c self, stct_ty: BasicTypeEnum<'c>, stct_mem: PointerValue<'c>, actual_index: u32) -> PointerValue<'c> {
+        if actual_index == 0 {
+            stct_mem
+        } else {
+            self.builder()
+                .build_struct_gep(stct_ty, stct_mem, actual_index, "address of field")
+                .unwrap()
+        }
+    }
+
+    /// Assigns the value to the field, handling aggregates in-place.
+    fn assign_field_value(&'c self, field: &(HIRExpr, Option<HIRType>), field_address: PointerValue<'c>) {
+        let field_is_aggr = field.1.as_ref().map(|t| t.is_aggr()).unwrap_or_default();
+        if field_is_aggr {
+            // Instantiate aggregate field directly at the calculated address
+            self.emmit_expr_impl(&field.0, false, Some(field_address));
+        } else {
+            // Evaluate and store the field value at the calculated address
+            let field_value = basic_value(self.emmit_expr(&field.0));
+            self.builder()
+                .build_store(field_address, field_value)
+                .unwrap();
         }
     }
 
@@ -1084,6 +1118,13 @@ impl<'c> Emmitter<'c> {
                 value,
                 assignment.1.as_ref()
             );
+        } else {
+            self.builder()
+                .build_store(
+                    lhs.into_pointer_value(),
+                    value
+                )
+                .unwrap();
         }
     }
 
@@ -1092,7 +1133,7 @@ impl<'c> Emmitter<'c> {
         if let Some(aggr_ty) = aggr {
             // do memcpy if assigning to aggregate type
             // get size of type
-            let size = self.context().i64_type().const_int(aggr_ty.size() as u64, false);
+            let size = self.context().i64_type().const_int(aggr_ty.size(true) as u64, false);
             // make memcpy
             self.builder()
                 .build_memcpy(
@@ -1447,16 +1488,21 @@ impl<'c> Emmitter<'c> {
         }
         let struct_type = self.llvm_type(struct_ty);
         let property_type = self.llvm_type(property_ty);
-        eprintln!("accessing index: {property_index}");
 
-        let address = self.builder()
-            .build_struct_gep(
-                basic_type(struct_type),
-                struct_value,
-                property_index,
-                "address of field"
-            )
-            .unwrap();
+        // if the property index is zero, we can
+        // just use the pointer directly
+        let address = if property_index == 0 {
+            struct_value
+        } else {
+            self.builder()
+                .build_struct_gep(
+                    basic_type(struct_type),
+                    struct_value,
+                    property_index,
+                    "address of field"
+                )
+                .unwrap()
+        };
 
         if take_lvalue {
             address.as_basic_value_enum()
@@ -1476,7 +1522,7 @@ impl<'c> Emmitter<'c> {
                         8,
                         self.context()
                             .i64_type()
-                            .const_int(property_ty.size() as u64, false)
+                            .const_int(property_ty.size(true) as u64, false)
                     )
                     .unwrap();
                 memory.as_basic_value_enum()
@@ -1519,7 +1565,7 @@ impl<'c> Emmitter<'c> {
                         8,
                         self.context()
                             .i64_type()
-                            .const_int(property_ty.size() as u64, false)
+                            .const_int(property_ty.size(true) as u64, false)
                     )
                     .unwrap();
                 memory.as_basic_value_enum()
@@ -1840,7 +1886,7 @@ fn index_aligned<'a>(iter: impl Iterator<Item = &'a (HIRType, bool)>, index: u32
         }
     }
 
-    unreachable!()
+    unreachable!("INVALID ALIGNED INDEX! Index: {index}, NumElements: {i}");
 }
 
 /// Struct returned by the `emmit_pattern` function.

@@ -119,7 +119,7 @@ impl Identifier {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 /// An integer literal.
 /// 
 /// Contains a sign for if this is negative.
@@ -939,9 +939,11 @@ pub mod tdecl {
 
      */
 
+    use derive_getters::Getters;
     use derive_new::new;
+    use either::Either;
 
-    use super::{Identifier, Loc, Type};
+    use super::{Identifier, IntLit, Loc, Type};
 
     #[derive(Debug, Clone, new)]
     /// The declaration of a type.
@@ -971,12 +973,43 @@ pub mod tdecl {
     pub enum UserType {
         Struct(Struct),
         Union(Vec<(Identifier, Type)>),
+        Sum(Vec<SumVariant>),
         // /// A sum type.
         // Sum {
         //     variants: Vec<SumTypeVariant>,
         // },
         //// An alias to another type.
         Alias(Type),
+    }
+
+    #[derive(Debug, Clone, new, PartialEq, Getters)]
+    /// A variant of a sum type.
+    pub struct SumVariant {
+        /// The name of the parent of this variant.
+        pub parent: Identifier,
+        /// The name of the variant.
+        pub name: Identifier,
+        /// The discriminant of this variant.
+        /// 
+        /// It's either a compiler-given number or
+        /// it is an user-specified number.
+        pub discriminant: IntLit,
+        /// Any fields which may come along with
+        /// the sum variant.
+        pub aggregate_fields: Option<SumFields>,
+    }
+
+    #[derive(Debug, Clone, new, PartialEq, Getters)]
+    /// The sum fields of the sum variant.
+    pub struct SumFields {
+        /// The key which denotes the start
+        /// of the fields.
+        left_key: Loc,
+        /// The fields themselves.
+        fields: Vec<(Identifier, Type)>,
+        /// The key which denotes the end
+        /// of the fields.
+        right_key: Loc,
     }
 
     // #[derive(Debug, Clone, new, PartialEq, Getters)]

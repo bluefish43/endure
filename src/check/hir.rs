@@ -379,6 +379,11 @@ pub mod typing {
         AlignedStruct(Vec<(HIRType, bool)>),
         /// An union type.
         Union(Vec<HIRType>),
+        /// A sum type.
+        SumType {
+            discriminant: Box<HIRType>,
+            variants: Vec<HIRType>,
+        },
         /// A pointer to a function.
         FunctionPointer(HIRPrototype),
         /// The void     type.
@@ -400,20 +405,28 @@ pub mod typing {
         }
 
         /// Gets the size of this type.
-        pub fn size(&self) -> usize {
+        pub fn size(&self, count_discriminant: bool) -> usize {
             match self {
                 Self::Primitive { loc, ty } => {
                     ty.size()
                 }
+                Self::SumType { discriminant, variants } => {
+                    // return the size of the discriminant +
+                    // the sizes of the variants
+                    (if count_discriminant { discriminant.size(false) } else { 0 }) + variants.iter()
+                        .map(|field| field.size(true))
+                        .max()
+                        .unwrap_or(0)
+                }
                 Self::Universe
                 | Self::Void => panic!("Obtaining size of illegal type"),
                 Self::SizedArray { size, element_type } => {
-                    element_type.size() * size.1 as usize
+                    element_type.size(true) * size.1 as usize
                 }
                 Self::FunctionPointer(_) => 8,
                 Self::Union(u) => {
                     u.iter()
-                        .map(|field| field.size())
+                        .map(|field| field.size(true))
                         .max()
                         .expect("No fields in union")
                 }
@@ -422,7 +435,7 @@ pub mod typing {
                 }
                 Self::AlignedStruct(al) => {
                     al.iter()
-                        .map(|field| field.0.size())
+                        .map(|field| field.0.size(true))
                         .sum()
                 }
                 Self::Pointer { pointee, mutability } => std::mem::size_of::<usize>(),
@@ -434,6 +447,7 @@ pub mod typing {
                 self,
                 Self::AlignedStruct(_)
                 | Self::Union(_)
+                | Self::SumType { .. }
             )
         }
 
@@ -445,12 +459,12 @@ pub mod typing {
                 let padding_types = [(8, TypeBits::B64), (4, TypeBits::B32), (2, TypeBits::B16), (1, TypeBits::B8)];
 
                 // Sort fields by size in descending order
-                fields.sort_by_key(|f| f.size());
+                fields.sort_by_key(|f| f.size(true));
 
                 let mut current_offset = 0;
 
                 for field in fields {
-                    let field_size = field.size();
+                    let field_size = field.size(true);
 
                     // Calculate padding needed for this field's alignment
                     let padding_size = (field_size - (current_offset % field_size)) % field_size;
