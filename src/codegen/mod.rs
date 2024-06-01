@@ -630,7 +630,7 @@ impl<'c> Emmitter<'c> {
                     )
                     .as_any_type_enum()
             }
-            HT::SumType { discriminant, variants } => {
+            HT::SumType { discriminant, variants: _ } => {
                 // get the type of the discriminant
                 let discriminant = basic_type(self.llvm_type(&discriminant));
                 // get the union of its contents

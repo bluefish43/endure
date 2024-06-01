@@ -694,6 +694,14 @@ impl Checker {
                     Some(HIRType::new_sized_array(size, Box::new(subtype)))
                 }
             }
+            Type::Tuple(t) => {
+                // typecheck each field
+                let mut hir_fields = vec![];
+                for subtype in t.into_iter() {
+                    hir_fields.push(self.pass_ty(subtype)?);
+                }
+                Some(self.struct_hir_ty_from_hir_fields(&hir_fields)?)
+            }
             Type::Void => Some(HIRType::new_void()),
             Type::FunctionPointer(sig) => {
                 let func = self.ctx.lookup_member(&sig.name().index())?;
@@ -3928,6 +3936,16 @@ fn ty_to_string(ty: &Type, collection: &Collection) -> String {
                 .join(", "),
             ty_to_string(proto.return_type(), collection)
         ),
+        T::Tuple(ts) => {
+            format!(
+                "({})",
+                ts
+                    .iter()
+                    .map(|ty| ty_to_string(&ty, collection))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
     }
 }
 

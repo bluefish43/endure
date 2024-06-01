@@ -687,6 +687,8 @@ pub mod typing {
         },
         /// A named type.
         NamedType(Identifier),
+        /// A tuple of other types.
+        Tuple(Vec<Type>),
         /// A named type which is being instantiated.
         /// 
         /// It's what is being instantiated and its
